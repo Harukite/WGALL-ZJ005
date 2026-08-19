@@ -37,6 +37,17 @@ export async function fetchJson(url, options = {}) {
   return body;
 }
 
+function stableId(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  if (!text || /^(undefined|null|nan|\[object object\])$/i.test(text)) return null;
+  return text;
+}
+
+function clientIdFrom(row) {
+  return stableId(row?.clientOrderId ?? row?.client_order_id ?? row?.clientOid ?? row?.client_oid);
+}
+
 export class LiveVenueExchange extends EventEmitter {
   constructor(opts = {}) {
     super();
@@ -56,6 +67,9 @@ export class LiveVenueExchange extends EventEmitter {
     this.prices = new Map();
     this.positions = new Map();
     this._tracked = new Map();
+    this._pendingPlacements = new Map();
+    this._pendingWrites = new Map();
+    this._writeSeq = 0;
     this._cancelled = new Set();
     this._watch = new Set();
     this._positionSnapshots = new Map();
@@ -94,11 +108,12 @@ export class LiveVenueExchange extends EventEmitter {
     this._applySnapshot(id, snapshot);
     if (!Array.isArray(snapshot?.openOrders)) return null;
     return snapshot.openOrders.map((order) => ({
-      orderId: String(order.orderId),
+      orderId: stableId(order.orderId ?? order.id),
       marketId: id,
       side: order.side === 'sell' ? 'sell' : 'buy',
       price: Number(order.price),
       sizeBase: Number(order.sizeBase || order.size || 0),
+      ...(clientIdFrom(order) ? { clientOrderId: clientIdFrom(order) } : {}),
     }));
   }
 
@@ -110,7 +125,8 @@ export class LiveVenueExchange extends EventEmitter {
   }
 
   adoptOrder(order) {
-    const id = String(order.orderId);
+    const id = stableId(order.orderId ?? order.id);
+    if (!id) throw new Error(this.venue + ' 权威挂单快照缺少稳定 orderId');
     this._tracked.set(id, {
       ...order,
       orderId: id,
@@ -145,10 +161,11 @@ export class LiveVenueExchange extends EventEmitter {
   }
 
   _registerPlaced(orderId, order) {
-    if (!orderId) throw new Error(this.venue + ' 下单成功但没有远端 orderId');
-    this._tracked.set(String(orderId), {
+    const id = stableId(orderId);
+    if (!id) throw new Error(this.venue + ' 下单成功但没有远端 orderId');
+    this._tracked.set(id, {
       ...order,
-      orderId: String(orderId),
+      orderId: id,
       marketId: Number(order.marketId),
       price: Number(order.price),
       sizeBase: Number(order.sizeBase),
@@ -159,7 +176,76 @@ export class LiveVenueExchange extends EventEmitter {
       gone: 0,
     });
     this._watch.add(Number(order.marketId));
-    return { orderId: String(orderId) };
+    return { orderId: id };
+  }
+
+  _assertNoPendingPlacements(action = '写操作') {
+    if (!this._pendingPlacements.size && !this._pendingWrites.size) return;
+    const pendingId = this._pendingPlacements.keys().next().value
+      || this._pendingWrites.keys().next().value;
+    const error = new Error(`${this.venue} 存在未完成的写入权威确认，拒绝继续${action}：${pendingId}`);
+    error.pending = true;
+    error.clientOrderId = this._pendingPlacements.keys().next().value;
+    error.writeId = this._pendingWrites.keys().next().value;
+    throw error;
+  }
+
+  _beginPendingWrite(kind, metadata = {}) {
+    const id = `${this.venue}:${kind}:${Date.now().toString(36)}:${++this._writeSeq}`;
+    const write = { id, kind, convergedReads: 0, submittedAt: Date.now(), ...metadata };
+    this._pendingWrites.set(id, write);
+    return write;
+  }
+
+  _finishPendingWrite(write) {
+    if (write?.id) this._pendingWrites.delete(write.id);
+  }
+
+  _beginPendingPlacement(order, clientOrderId, options = {}) {
+    const key = stableId(clientOrderId);
+    if (!key) throw new Error(this.venue + ' 下单缺少稳定 clientOrderId');
+    const pending = {
+      clientOrderId: key,
+      order: { ...order },
+      previousIds: new Set(options.previousIds || []),
+      submittedAt: Date.now(),
+    };
+    pending.write = this._beginPendingWrite('place', {
+      marketId: Number(order.marketId),
+      clientOrderId: key,
+    });
+    this._pendingPlacements.set(key, pending);
+    return pending;
+  }
+
+  _pendingPlacementError(error, pending, message = '') {
+    const result = error instanceof Error ? error : new Error(String(error || message || '订单写入结果未知'));
+    if (message) result.message = message + (result.message ? '：' + result.message : '');
+    result.pending = true;
+    result.clientOrderId = pending.clientOrderId;
+    result.writeId = pending.write?.id;
+    return result;
+  }
+
+  _resolvePendingPlacements(openOrders) {
+    const claimed = new Set();
+    for (const [clientOrderId, pending] of [...this._pendingPlacements]) {
+      const matches = openOrders.filter((row) => clientIdFrom(row) === clientOrderId
+        && !claimed.has(stableId(row.orderId ?? row.id)));
+      if (matches.length !== 1) continue;
+      const row = matches[0];
+      const orderId = stableId(row.orderId ?? row.id);
+      if (!orderId) throw new Error(this.venue + ' pending 订单已匹配但缺少稳定 orderId');
+      claimed.add(orderId);
+      this._pendingPlacements.delete(clientOrderId);
+      this._finishPendingWrite(pending.write);
+      this._registerPlaced(orderId, {
+        ...pending.order,
+        clientOrderId,
+        price: Number(row.price ?? pending.order.price),
+        sizeBase: Number(row.sizeBase ?? row.size ?? pending.order.sizeBase),
+      });
+    }
   }
 
   _markCancelled(orderId) {
@@ -174,6 +260,13 @@ export class LiveVenueExchange extends EventEmitter {
   _applySnapshot(marketId, snapshot) {
     if (!snapshot || !Array.isArray(snapshot.openOrders)) return;
     const id = Number(marketId);
+    for (const order of snapshot.openOrders) {
+      if (!stableId(order.orderId ?? order.id)) {
+        throw new Error(this.venue + ' 权威挂单快照缺少稳定 orderId，拒绝继续交易');
+      }
+    }
+    this._reconcilePendingWrites(id, snapshot);
+    this._resolvePendingPlacements(snapshot.openOrders);
     const previousPosition = this._positionSnapshots.get(id);
     const positionPresent = Object.prototype.hasOwnProperty.call(snapshot, 'position');
     const currentPosition = !positionPresent || snapshot.position == null
@@ -198,7 +291,7 @@ export class LiveVenueExchange extends EventEmitter {
       else this.positions.delete(id);
     }
     const open = snapshot.openOrders;
-    const openById = new Map(open.map((order) => [String(order.orderId || order.id), order]));
+    const openById = new Map(open.map((order) => [stableId(order.orderId ?? order.id), order]));
     const now = Date.now();
     const candidates = [];
     for (const [orderId, tracked] of this._tracked) {
@@ -264,6 +357,31 @@ export class LiveVenueExchange extends EventEmitter {
     this.lastOkAt = now;
     this.lastError = null;
     this.dataSource = 'real';
+  }
+
+  _reconcilePendingWrites(marketId, snapshot) {
+    const id = Number(marketId);
+    const openIds = new Set(snapshot.openOrders.map((order) => stableId(order.orderId ?? order.id)));
+    const positionPresent = Object.prototype.hasOwnProperty.call(snapshot, 'position');
+    const positionSize = !positionPresent || snapshot.position == null
+      ? 0
+      : Number(typeof snapshot.position === 'object' ? snapshot.position.sizeBase : snapshot.position);
+    for (const [writeId, write] of [...this._pendingWrites]) {
+      if (write.kind === 'place' || (write.marketId != null && Number(write.marketId) !== id)) continue;
+      let converged = false;
+      if (write.kind === 'cancel') converged = !openIds.has(stableId(write.orderId));
+      else if (write.kind === 'cancelAll') {
+        converged = (write.orderIds || []).every((orderId) => !openIds.has(stableId(orderId)));
+      } else if (write.kind === 'closePosition') {
+        converged = positionPresent && Number.isFinite(positionSize) && Math.abs(positionSize) <= 1e-12;
+      }
+      if (!converged) {
+        write.convergedReads = 0;
+        continue;
+      }
+      write.convergedReads = (write.convergedReads || 0) + 1;
+      if (write.convergedReads >= 2) this._pendingWrites.delete(writeId);
+    }
   }
 
   async _poll() {

@@ -163,12 +163,20 @@ export class N1Exchange extends LiveVenueExchange {
     }
     const rows = accountOrders
       .filter((row) => Number(row.marketId) === this._remoteMarketId)
-      .map((row) => ({
-        orderId: String(row.orderId),
-        side: row.side === 'bid' || row.side === 'Bid' ? 'buy' : 'sell',
-        price: num(row.price ?? row.placedPrice),
-        sizeBase: num(row.size ?? row.originalOrderSize),
-      }))
+      .map((row) => {
+        const rawOrderId = row.orderId ?? row.id;
+        const orderId = String(rawOrderId ?? '').trim();
+        if (!orderId || /^(undefined|null|nan|\[object object\])$/i.test(orderId)) {
+          throw new Error('N1 权威挂单快照缺少稳定 orderId，拒绝继续交易');
+        }
+        return {
+          orderId,
+          clientOrderId: row.clientOrderId ?? row.client_order_id ?? null,
+          side: row.side === 'bid' || row.side === 'Bid' ? 'buy' : 'sell',
+          price: num(row.price ?? row.placedPrice),
+          sizeBase: num(row.size ?? row.originalOrderSize),
+        };
+      })
       .filter((row) => row.price > 0 && row.sizeBase > 0);
     const balances = accountBalances;
     const usdc = balances.find((row) => String(row.symbol || '').toUpperCase() === 'USDC');
@@ -207,20 +215,44 @@ export class N1Exchange extends LiveVenueExchange {
 
   async placeLimitOrder(order) {
     this._ensure();
+    this._assertNoPendingPlacements('下单');
     if (!this.tradingArmed) throw new Error('N1 实盘下单未授权：设置 N1_TRADING_ARMED=YES');
     await this._ensureSession();
-    const receipt = await this.user.placeOrder({
-      marketId: this._remoteMarketId,
-      side: order.side === 'buy' ? Side.Bid : Side.Ask,
-      fillMode: FillMode.PostOnly,
-      isReduceOnly: !!order.reduceOnly,
-      size: Number(order.sizeBase),
-      price: Number(order.price),
-      accountId: this.accountId,
-      clientOrderId: clientOrderId('grid:' + order.side + ':' + order.levelIndex + ':' + order.clientOrderId),
-    });
-    const orderId = receipt?.orderId ?? receipt?.id;
-    return this._registerPlaced(orderId, order);
+    const remoteClientOrderId = clientOrderId('grid:' + order.side + ':' + order.levelIndex + ':' + order.clientOrderId);
+    const pending = this._beginPendingPlacement({
+      ...order,
+      clientOrderId: String(remoteClientOrderId),
+    }, remoteClientOrderId);
+    try {
+      const receipt = await this.user.placeOrder({
+        marketId: this._remoteMarketId,
+        side: order.side === 'buy' ? Side.Bid : Side.Ask,
+        fillMode: FillMode.PostOnly,
+        isReduceOnly: !!order.reduceOnly,
+        size: Number(order.sizeBase),
+        price: Number(order.price),
+        accountId: this.accountId,
+        clientOrderId: remoteClientOrderId,
+      });
+      const orderId = receipt?.orderId ?? receipt?.id;
+      if (orderId == null || /^(undefined|null|nan|\[object object\])$/i.test(String(orderId).trim())) {
+        throw this._pendingPlacementError(
+          new Error('N1 下单回执缺少稳定 orderId'),
+          pending,
+          'N1 下单结果未知，等待权威挂单对账',
+        );
+      }
+      const result = this._registerPlaced(orderId, {
+        ...order,
+        clientOrderId: pending.clientOrderId,
+      });
+      this._pendingPlacements.delete(pending.clientOrderId);
+      this._finishPendingWrite(pending.write);
+      return result;
+    } catch (error) {
+      if (!error?.pending) this._pendingPlacementError(error, pending, 'N1 下单结果未知，等待权威挂单对账');
+      throw error;
+    }
   }
 
   async placeLimitOrders(orders) {
@@ -231,42 +263,84 @@ export class N1Exchange extends LiveVenueExchange {
 
   async cancelOrder(marketId, orderId) {
     this._ensure();
+    this._assertNoPendingPlacements('撤单');
     await this._ensureSession();
-    await this.user.cancelOrder(BigInt(String(orderId)), this.accountId);
-    this._markCancelled(orderId);
+    const write = this._beginPendingWrite('cancel', { marketId: Number(marketId), orderId: String(orderId) });
+    try {
+      await this.user.cancelOrder(BigInt(String(orderId)), this.accountId);
+      this._finishPendingWrite(write);
+      this._markCancelled(orderId);
+    } catch (error) {
+      error.pending = true;
+      error.writeId = write.id;
+      throw error;
+    }
     return true;
   }
 
   async cancelAll(marketId) {
     this._ensure();
+    this._assertNoPendingPlacements('撤销全部挂单');
     await this.user.fetchInfo();
     await this._ensureSession();
     const rows = (this.user.orders?.[String(this.accountId)] || [])
       .filter((row) => Number(row.marketId) === this._remoteMarketId);
-    for (const row of rows) await this.user.cancelOrder(BigInt(String(row.orderId)), this.accountId);
+    const orderIds = rows.map((row) => String(row.orderId ?? row.id ?? '').trim());
+    for (const orderId of orderIds) {
+      if (!orderId || /^(undefined|null|nan|\[object object\])$/i.test(orderId)) {
+        throw new Error('N1 撤单快照缺少稳定 orderId，拒绝继续撤单');
+      }
+    }
+    const write = this._beginPendingWrite('cancelAll', { marketId: Number(marketId), orderIds });
+    try {
+      for (const orderId of orderIds) {
+        await this.user.cancelOrder(BigInt(orderId), this.accountId);
+      }
+      this._finishPendingWrite(write);
+    } catch (error) {
+      error.pending = true;
+      error.writeId = write.id;
+      throw error;
+    }
     this._markMarketCancelled(marketId);
     return true;
   }
 
   async closePosition(marketId) {
     this._ensure();
+    this._assertNoPendingPlacements('平仓');
     if (!this.tradingArmed) throw new Error('N1 实盘平仓未授权：设置 N1_TRADING_ARMED=YES');
     const snapshot = await this._refreshMarket(marketId);
     const position = Number(snapshot.position?.sizeBase || 0);
     if (!position) return true;
     const price = Number(snapshot.price);
     await this._ensureSession();
-    const receipt = await this.user.placeOrder({
-      marketId: this._remoteMarketId,
-      side: position > 0 ? Side.Ask : Side.Bid,
-      fillMode: FillMode.ImmediateOrCancel,
-      isReduceOnly: true,
-      size: Math.abs(position),
-      price: position > 0 ? price * 0.992 : price * 1.008,
-      accountId: this.accountId,
-      clientOrderId: clientOrderId('flat:' + Date.now()),
-    });
-    if (!receipt?.orderId && !receipt?.id) throw new Error('N1 平仓回执缺少 orderId');
+    const write = this._beginPendingWrite('closePosition', { marketId: Number(marketId) });
+    try {
+      const receipt = await this.user.placeOrder({
+        marketId: this._remoteMarketId,
+        side: position > 0 ? Side.Ask : Side.Bid,
+        fillMode: FillMode.ImmediateOrCancel,
+        isReduceOnly: true,
+        size: Math.abs(position),
+        price: position > 0 ? price * 0.992 : price * 1.008,
+        accountId: this.accountId,
+        clientOrderId: clientOrderId('flat:' + Date.now()),
+      });
+      if (!receipt?.orderId && !receipt?.id && !(Array.isArray(receipt?.fills) && receipt.fills.length)) {
+        const error = new Error('N1 平仓回执缺少 orderId/fills，结果未知');
+        error.pending = true;
+        error.writeId = write.id;
+        throw error;
+      }
+      this._finishPendingWrite(write);
+    } catch (error) {
+      if (!error?.pending) {
+        error.pending = true;
+        error.writeId = write.id;
+      }
+      throw error;
+    }
     return true;
   }
 }

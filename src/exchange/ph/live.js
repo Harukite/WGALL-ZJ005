@@ -85,6 +85,8 @@ export class PhoenixExchange extends LiveVenueExchange {
     this.keypairPath = opts.keypairPath || path.resolve(process.cwd(), 'secrets', this.id === 'ph2' ? 'phoenix2.key' : 'phoenix.key');
     this.computeUnitLimit = Number(opts.computeUnitLimit || 600_000);
     this.orderGapMs = Math.max(0, Number(opts.orderGapMs || 800));
+    this.orderDiscoveryPollMs = Math.max(0, Number(opts.orderDiscoveryPollMs ?? 300));
+    this.orderDiscoveryAttempts = Math.max(1, Math.floor(Number(opts.orderDiscoveryAttempts ?? 6)));
     this.client = null;
     this.kp = null;
     this.conn = null;
@@ -182,12 +184,30 @@ export class PhoenixExchange extends LiveVenueExchange {
     }).compileToV0Message();
     const tx = new VersionedTransaction(message);
     tx.sign([this.kp]);
-    const signature = await this.conn.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
-    const confirmation = await this.conn.confirmTransaction(
-      { signature, blockhash, lastValidBlockHeight },
-      'confirmed',
-    );
-    if (confirmation.value.err) throw new Error(this.id + ' Solana 交易失败：' + JSON.stringify(confirmation.value.err));
+    let signature;
+    try {
+      signature = await this.conn.sendTransaction(tx, { skipPreflight: false, maxRetries: 3 });
+    } catch (error) {
+      error.pending = true;
+      throw error;
+    }
+    let confirmation;
+    try {
+      confirmation = await this.conn.confirmTransaction(
+        { signature, blockhash, lastValidBlockHeight },
+        'confirmed',
+      );
+    } catch (error) {
+      error.pending = true;
+      error.txSignature = signature;
+      throw error;
+    }
+    if (confirmation.value.err) {
+      const error = new Error(this.id + ' Solana 交易失败：' + JSON.stringify(confirmation.value.err));
+      error.receiptKnown = true;
+      error.txSignature = signature;
+      throw error;
+    }
     return signature;
   }
 
@@ -239,7 +259,12 @@ export class PhoenixExchange extends LiveVenueExchange {
         const sizeBase = num(row.sizeRemainingLots ?? row.initialSizeLots) * LOT;
         const priceValue = num(row.priceUsd ?? row.priceTicks);
         const sequence = row.orderSequenceNumber;
-        if (!(sizeBase > 0) || !(priceValue > 0) || sequence == null) continue;
+        if (!(sizeBase > 0) || !(priceValue > 0)) {
+          throw new Error(this.id + ' 权威挂单快照包含无效价格或数量，拒绝继续交易');
+        }
+        if (sequence == null || row.priceTicks == null) {
+          throw new Error(this.id + ' 权威挂单快照缺少可撤销的 priceTicks/orderSequenceNumber');
+        }
         openOrders.push({
           orderId: orderId(row.priceTicks ?? Math.round(priceValue), sequence),
           clientOrderId: row.clientOrderId ?? row.client_order_id ?? '',
@@ -263,25 +288,22 @@ export class PhoenixExchange extends LiveVenueExchange {
     return false;
   }
 
-  async _findPlacedOrder(marketId, order, previousIds = new Set()) {
-    for (let attempt = 0; attempt < 6; attempt++) {
+  async _findPlacedOrder(marketId, order) {
+    for (let attempt = 0; attempt < this.orderDiscoveryAttempts; attempt++) {
       const snapshot = await this._refreshMarket(marketId);
       const exact = snapshot.openOrders.find((row) => row.clientOrderId
         && String(row.clientOrderId) === String(order.clientOrderId));
       if (exact) return exact;
-      const candidates = snapshot.openOrders
-        .filter((row) => !previousIds.has(String(row.orderId)))
-        .filter((row) => row.side === order.side)
-        .filter((row) => Math.abs(Number(row.price) - Number(order.price)) <= 2)
-        .filter((row) => Math.abs(Number(row.sizeBase) - Number(order.sizeBase)) <= Math.max(LOT, Number(order.sizeBase) * 0.01));
-      if (candidates.length === 1) return candidates[0];
-      await sleep(300);
+      if (attempt + 1 < this.orderDiscoveryAttempts && this.orderDiscoveryPollMs) {
+        await sleep(this.orderDiscoveryPollMs);
+      }
     }
     return null;
   }
 
   async placeLimitOrder(order) {
     this._ensure();
+    this._assertNoPendingPlacements('下单');
     const marketId = Number(order.marketId);
     const symbol = this._symbolForMarket(marketId);
     const size = roundLot(Number(order.sizeBase));
@@ -299,6 +321,8 @@ export class PhoenixExchange extends LiveVenueExchange {
       priceUsd: String(price),
       baseUnits: String(size),
     });
+    const remoteClientOrderId = BigInt(order.clientOrderId || Date.now());
+    if (remoteClientOrderId <= 0n) throw new Error(this.id + ' 下单缺少稳定 clientOrderId');
     const ix = await this.client.ixs.buildPlacePostOnlyOrder({
       authority: this.authority,
       symbol,
@@ -306,7 +330,7 @@ export class PhoenixExchange extends LiveVenueExchange {
         side: packet.side,
         priceInTicks: packet.priceInTicks,
         numBaseLots: packet.numBaseLots,
-        clientOrderId: BigInt(order.clientOrderId || 0),
+        clientOrderId: remoteClientOrderId,
         slide: true,
         lastValidSlot: null,
         orderFlags: order.reduceOnly ? (packet.orderFlags | OrderFlags.ReduceOnly) : packet.orderFlags,
@@ -315,11 +339,50 @@ export class PhoenixExchange extends LiveVenueExchange {
       traderPdaIndex: 0,
       traderSubaccountIndex: 0,
     });
-    await this._sendIxs([ix]);
-    const previousIds = new Set(before.openOrders.map((row) => String(row.orderId)));
-    const placed = await this._findPlacedOrder(marketId, { ...order, sizeBase: size, price }, previousIds);
-    if (!placed) throw new Error(this.id + ' 交易已确认但权威挂单列表暂未发现订单，停止自动重发');
-    return this._registerPlaced(placed.orderId, { ...order, price: placed.price, sizeBase: placed.sizeBase });
+    const pending = this._beginPendingPlacement({
+      ...order,
+      marketId,
+      clientOrderId: String(remoteClientOrderId),
+      price,
+      sizeBase: size,
+    }, remoteClientOrderId);
+    try {
+      const signature = await this._sendIxs([ix]);
+      pending.txSignature = signature;
+      const placed = await this._findPlacedOrder(marketId, {
+        ...order,
+        clientOrderId: String(remoteClientOrderId),
+        sizeBase: size,
+        price,
+      });
+      if (!placed) {
+        throw this._pendingPlacementError(
+          new Error(this.id + ' 交易已确认但权威挂单列表暂未发现订单'),
+          pending,
+          this.id + ' 订单发现结果未知，等待权威挂单对账',
+        );
+      }
+      const result = this._registerPlaced(placed.orderId, {
+        ...order,
+        clientOrderId: String(remoteClientOrderId),
+        price: placed.price,
+        sizeBase: placed.sizeBase,
+      });
+      this._pendingPlacements.delete(pending.clientOrderId);
+      this._finishPendingWrite(pending.write);
+      return result;
+    } catch (error) {
+      if (error?.receiptKnown) {
+        this._pendingPlacements.delete(pending.clientOrderId);
+        this._finishPendingWrite(pending.write);
+      } else if (!error?.pending) {
+        this._pendingPlacementError(error, pending, this.id + ' 下单结果未知，等待权威挂单对账');
+      } else {
+        error.clientOrderId = error.clientOrderId || pending.clientOrderId;
+        error.writeId = error.writeId || pending.write?.id;
+      }
+      throw error;
+    }
   }
 
   async placeLimitOrders(orders) {
@@ -330,6 +393,7 @@ export class PhoenixExchange extends LiveVenueExchange {
 
   async cancelOrder(marketId, orderIdValue) {
     this._ensure();
+    this._assertNoPendingPlacements('撤单');
     const parsed = parseOrderId(orderIdValue);
     if (!parsed) throw new Error(this.id + ' 无法解析 orderId=' + orderIdValue);
     const ix = await this.client.ixs.buildCancelOrdersById({
@@ -339,26 +403,54 @@ export class PhoenixExchange extends LiveVenueExchange {
       traderPdaIndex: 0,
       traderSubaccountIndex: 0,
     });
-    await this._sendIxs([ix]);
+    const write = this._beginPendingWrite('cancel', { marketId: Number(marketId), orderId: String(orderIdValue) });
+    try {
+      await this._sendIxs([ix]);
+      this._finishPendingWrite(write);
+    } catch (error) {
+      if (error?.receiptKnown) this._finishPendingWrite(write);
+      else {
+        error.pending = true;
+        error.writeId = write.id;
+      }
+      throw error;
+    }
     this._markCancelled(orderIdValue);
     return true;
   }
 
   async cancelAll(marketId) {
     this._ensure();
+    this._assertNoPendingPlacements('撤销全部挂单');
+    const before = await this._refreshMarket(marketId);
     const ix = await this.client.ixs.buildCancelAll({
       authority: this.authority,
       symbol: this._symbolForMarket(marketId),
       traderPdaIndex: 0,
       traderSubaccountIndex: 0,
     });
-    await this._sendIxs([ix]);
+    const write = this._beginPendingWrite('cancelAll', {
+      marketId: Number(marketId),
+      orderIds: before.openOrders.map((row) => String(row.orderId)),
+    });
+    try {
+      await this._sendIxs([ix]);
+      this._finishPendingWrite(write);
+    } catch (error) {
+      if (error?.receiptKnown) this._finishPendingWrite(write);
+      else {
+        error.pending = true;
+        error.writeId = write.id;
+      }
+      throw error;
+    }
     this._markMarketCancelled(marketId);
     return true;
   }
 
   async closePosition(marketId) {
     this._ensure();
+    this._assertNoPendingPlacements('平仓');
     const snapshot = await this._refreshMarket(marketId);
     const position = Number(snapshot.position?.sizeBase || 0);
     if (!position) return true;
@@ -376,7 +468,18 @@ export class PhoenixExchange extends LiveVenueExchange {
       traderPdaIndex: 0,
       traderSubaccountIndex: 0,
     });
-    await this._sendIxs([ix]);
+    const write = this._beginPendingWrite('closePosition', { marketId: Number(marketId) });
+    try {
+      await this._sendIxs([ix]);
+      this._finishPendingWrite(write);
+    } catch (error) {
+      if (error?.receiptKnown) this._finishPendingWrite(write);
+      else {
+        error.pending = true;
+        error.writeId = write.id;
+      }
+      throw error;
+    }
     return true;
   }
 }

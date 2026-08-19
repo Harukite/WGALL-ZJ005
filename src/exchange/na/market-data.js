@@ -14,7 +14,10 @@ const CHAIN_ENV_BY_NETWORK = {
 const clientCache = new Map();
 
 function chainEnvFor(network) {
-  return CHAIN_ENV_BY_NETWORK[String(network || 'ink-mainnet').toLowerCase()] || 'inkMainnet';
+  const key = String(network || 'ink-mainnet').trim().toLowerCase();
+  const chainEnv = CHAIN_ENV_BY_NETWORK[key];
+  if (!chainEnv) throw new Error('Nado 不支持 network=' + network + '，拒绝读取行情');
+  return chainEnv;
 }
 
 function publicClientFor({ network, rpcUrl }) {

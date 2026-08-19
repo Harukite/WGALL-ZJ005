@@ -54,3 +54,5 @@
 - 2026-08-19：新增交易所的前端必须复用 `makeExchangeCtrl` 和既有控制台布局；独立紧凑面板会造成趋势、风险、补格、恢复和账户监控能力不一致，禁止再引入第二套 venue 控制器。
 - 2026-08-19：paper 模式的真实行情应通过交易所公开只读接口读取，价格更新仍调用宿主 paper 的本地 `setPrice`/撮合路径；网络失败必须保留合成回退并标记 `synthetic`。N1 当前公开历史接口只有 hourly snapshot，不能把它宣称成任意周期的原生 OHLC。
 - 2026-08-19：PopDEX live 的链上交易回执必须与 indexer 订单确认分开建模；下单后以 `clientOid → orderId` pending 映射收敛，撤单复用已确认的 `clientOid`，回执或订单发现不确定时禁止新的写入和自动重发。
+- 2026-08-19：N1/Phoenix/Phoenix2 的 live 写入统一要求 stable client order id；回执、Solana 确认或权威挂单发现不确定时必须留在 pending，后续只接受精确 client id 的权威快照收敛，不允许用价格/数量模糊匹配重发。
+- 2026-08-19：Nado 的 reduce-only maker 仍不能由协议表达；应保留普通 PostOnly 与 IOC reduce-only 平仓能力，拒绝把 reduce-only 限价腿降级为普通开仓单，并对未知 network、digest 缺失和失败 IOC 结果 fail-closed。

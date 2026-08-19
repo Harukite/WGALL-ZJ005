@@ -19,6 +19,10 @@ import { fetchNadoCandles } from './market-data.js';
 const CHAIN_ENV_BY_NETWORK = {
   'ink-mainnet': 'inkMainnet',
   'ink-testnet': 'inkTestnet',
+  inkmainnet: 'inkMainnet',
+  inktestnet: 'inkTestnet',
+  mainnet: 'inkMainnet',
+  testnet: 'inkTestnet',
 };
 const DEFAULT_PRODUCT_ID = 2;
 const INTERNAL_MARKET_ID = 1;
@@ -38,6 +42,13 @@ function loadPrivateKey(privateKey, keyPath) {
   return (raw.startsWith('0x') ? raw : '0x' + raw);
 }
 
+function chainEnvFor(network) {
+  const key = String(network || 'ink-mainnet').trim().toLowerCase();
+  const chainEnv = CHAIN_ENV_BY_NETWORK[key];
+  if (!chainEnv) throw new Error('Nado 不支持 network=' + network + '，拒绝 LIVE 初始化');
+  return chainEnv;
+}
+
 export class NadoExchange extends LiveVenueExchange {
   constructor(opts = {}) {
     super({
@@ -55,7 +66,7 @@ export class NadoExchange extends LiveVenueExchange {
     this.client = null;
     this.address = '';
     this.chain = null;
-    this.chainEnv = CHAIN_ENV_BY_NETWORK[String(this.network || 'ink-mainnet').toLowerCase()] || 'inkMainnet';
+    this.chainEnv = chainEnvFor(this.network);
   }
 
   async init() {
@@ -161,8 +172,12 @@ export class NadoExchange extends LiveVenueExchange {
       if (!unfilled) continue;
       const price = roundToStep(humanAmount(order.price) || num(order.price), PRICE_INC);
       if (!(price > 0)) continue;
+      const digest = String(order.digest ?? '').trim();
+      if (!digest || /^(undefined|null|nan|\[object object\])$/i.test(digest)) {
+        throw new Error('Nado 权威挂单快照缺少稳定 digest，拒绝继续交易');
+      }
       openOrders.push({
-        orderId: String(order.digest),
+        orderId: digest,
         side: unfilled > 0 ? 'buy' : 'sell',
         price,
         sizeBase: Math.abs(unfilled),
@@ -184,6 +199,7 @@ export class NadoExchange extends LiveVenueExchange {
 
   async placeLimitOrder(order) {
     const client = this._ensure();
+    this._assertNoPendingPlacements('下单');
     if (order.reduceOnly) {
       throw new Error('Nado 仅支持 taker reduce-only；当前网格的 reduce-only 限价腿不能安全映射，已拒绝下单');
     }
@@ -195,23 +211,48 @@ export class NadoExchange extends LiveVenueExchange {
       throw new Error('Nado PostOnly 订单穿价，等待下一轮行情');
     }
     const signedAmount = order.side === 'buy' ? addDecimals(size) : addDecimals(-size);
-    const result = await client.market.placeOrder({
-      productId: this.productId,
-      order: {
-        subaccountName: this.subaccountName,
-        price,
-        amount: signedAmount,
-        expiration: nowInSeconds() + 86400 * 28,
-        appendix: packOrderAppendix({
-          orderExecutionType: 'post_only',
-          reduceOnly: !!order.reduceOnly,
-        }),
-      },
+    const write = this._beginPendingWrite('place', {
+      marketId: Number(order.marketId),
+      price,
+      sizeBase: size,
     });
-    if (result?.status === 'failure') throw new Error('Nado 下单失败：' + (result.error || '未知错误'));
-    const directId = result?.data?.digest ?? result?.digest ?? result?.orderId ?? result?.id;
-    if (!directId) throw new Error('Nado 下单回执缺少 digest，拒绝按模糊条件绑定订单');
-    return this._registerPlaced(String(directId), { ...order, price, sizeBase: size });
+    try {
+      const result = await client.market.placeOrder({
+        productId: this.productId,
+        order: {
+          subaccountName: this.subaccountName,
+          price,
+          amount: signedAmount,
+          expiration: nowInSeconds() + 86400 * 28,
+          appendix: packOrderAppendix({
+            orderExecutionType: 'post_only',
+            reduceOnly: !!order.reduceOnly,
+          }),
+        },
+      });
+      if (result?.status === 'failure') {
+        this._finishPendingWrite(write);
+        const error = new Error('Nado 下单失败：' + (result.error || '未知错误'));
+        error.receiptKnown = true;
+        throw error;
+      }
+      const directId = result?.data?.digest ?? result?.digest ?? result?.orderId ?? result?.id;
+      if (!directId) {
+        const error = new Error('Nado 下单回执缺少 digest，结果未知，等待人工/权威核验');
+        error.pending = true;
+        error.writeId = write.id;
+        throw error;
+      }
+      const placed = this._registerPlaced(String(directId), { ...order, price, sizeBase: size });
+      this._finishPendingWrite(write);
+      return placed;
+    } catch (error) {
+      if (!error?.pending && !error?.receiptKnown) {
+        error.pending = true;
+        error.writeId = write.id;
+      }
+      throw error;
+    }
   }
 
   async placeLimitOrders(orders) {
@@ -222,43 +263,80 @@ export class NadoExchange extends LiveVenueExchange {
 
   async cancelOrder(marketId, orderId) {
     const client = this._ensure();
-    await client.market.cancelOrders({
-      digests: [String(orderId)],
-      productIds: [this.productId],
-      subaccountName: this.subaccountName,
-    });
+    this._assertNoPendingPlacements('撤单');
+    const write = this._beginPendingWrite('cancel', { marketId: Number(marketId), orderId: String(orderId) });
+    try {
+      await client.market.cancelOrders({
+        digests: [String(orderId)],
+        productIds: [this.productId],
+        subaccountName: this.subaccountName,
+      });
+      this._finishPendingWrite(write);
+    } catch (error) {
+      error.pending = true;
+      error.writeId = write.id;
+      throw error;
+    }
     this._markCancelled(orderId);
     return true;
   }
 
   async cancelAll(marketId) {
     const client = this._ensure();
-    await client.market.cancelProductOrders({
-      productIds: [this.productId],
-      subaccountName: this.subaccountName,
-    });
+    this._assertNoPendingPlacements('撤销全部挂单');
+    const before = await this._refreshMarket(marketId);
+    const orderIds = before.openOrders.map((order) => String(order.orderId));
+    const write = this._beginPendingWrite('cancelAll', { marketId: Number(marketId), orderIds });
+    try {
+      await client.market.cancelProductOrders({
+        productIds: [this.productId],
+        subaccountName: this.subaccountName,
+      });
+      this._finishPendingWrite(write);
+    } catch (error) {
+      error.pending = true;
+      error.writeId = write.id;
+      throw error;
+    }
     this._markMarketCancelled(marketId);
     return true;
   }
 
   async closePosition(marketId) {
     const client = this._ensure();
+    this._assertNoPendingPlacements('平仓');
     const snapshot = await this._refreshMarket(marketId);
     const position = Number(snapshot.position?.sizeBase || 0);
     if (!position) return true;
     const mid = Number(snapshot.price || await this._mid());
     const size = roundToStep(Math.abs(position), SIZE_INC, 'down');
     const amount = position > 0 ? addDecimals(-size) : addDecimals(size);
-    await client.market.placeOrder({
-      productId: this.productId,
-      order: {
-        subaccountName: this.subaccountName,
-        price: roundToStep(position > 0 ? mid * 0.998 : mid * 1.002, PRICE_INC),
-        amount,
-        expiration: nowInSeconds() + 120,
-        appendix: packOrderAppendix({ orderExecutionType: 'ioc', reduceOnly: true }),
-      },
-    });
+    const write = this._beginPendingWrite('closePosition', { marketId: Number(marketId) });
+    try {
+      const result = await client.market.placeOrder({
+        productId: this.productId,
+        order: {
+          subaccountName: this.subaccountName,
+          price: roundToStep(position > 0 ? mid * 0.998 : mid * 1.002, PRICE_INC),
+          amount,
+          expiration: nowInSeconds() + 120,
+          appendix: packOrderAppendix({ orderExecutionType: 'ioc', reduceOnly: true }),
+        },
+      });
+      if (result?.status === 'failure' || result?.data?.status === 'failure') {
+        this._finishPendingWrite(write);
+        const error = new Error('Nado 平仓失败：' + (result.error || result.data?.error || '未知错误'));
+        error.receiptKnown = true;
+        throw error;
+      }
+      this._finishPendingWrite(write);
+    } catch (error) {
+      if (!error?.pending && !error?.receiptKnown) {
+        error.pending = true;
+        error.writeId = write.id;
+      }
+      throw error;
+    }
     return true;
   }
 }

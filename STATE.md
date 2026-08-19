@@ -5,10 +5,11 @@
 - 2026-08-19（Asia/Shanghai）：完成 N1、Phoenix、Phoenix2、Nado、PopDEX 的 paper/live 适配器接入、服务端/AI/仪表盘注册、统一 UI 控制台和 paper 网格闭环验证；五个新增适配器已用现有 `GridBot` 完成中性/做多/做空启停测试，N1 页面完成启动/停止按钮闭环；未触发真实交易。
 - 2026-08-19（Asia/Shanghai）：继续修复 paper 行情链路；五所 paper 适配器已连接公开真实价格/K 线，服务端 `/api/n1|ph|ph2|na|pd/trend` 均实测返回 `dataSource=real`，网格策略文件哈希未变。
 - 2026-08-19（Asia/Shanghai）：完成 PopDEX live 写入闭环：严格校验 symbol 元数据与 RPC chain ID；链上 receipt、indexer 订单发现、`clientOid → orderId` 映射、带 clientOid 撤单和 pending/不重复写入保护均已覆盖本地 RPC/API 集成测试；未使用真实账户或发送主网交易。
+- 2026-08-19（Asia/Shanghai）：补齐 N1、Phoenix、Phoenix2 live 的稳定 client order id、权威订单发现和 pending/reconcile；Solana/N1 写结果不确定时阻断后续写操作，撤单/平仓未知结果等待连续权威快照收敛。新增 `test/live-new-exchange-lifecycle.test.js` 覆盖三所成功与延迟发现路径；未使用真实账户或发送真实订单。
 
 ## 当前任务
 
-- 用户已确认实施 N1、Phoenix、Phoenix2、Nado、PopDEX；当前接入与 UI 一致性范围已完成，策略冻结。不得修改 `src/grid.js`、`src/bot.js` 的网格算法和订单编排语义。
+- N1、Phoenix、Phoenix2 的 live 适配器已补齐本地可验证的下单—权威订单确认—撤单/平仓未知结果收敛；Nado 已单独加强 fail-closed，但因协议不支持 reduce-only maker，现有长/短网格 live 仍不等价支持。策略冻结，继续不得修改 `src/grid.js`、`src/bot.js` 的网格算法和订单编排语义。
 
 ## 已确认
 
@@ -34,6 +35,8 @@
 - PopDEX 的链上交易回执不等于订单簿订单确认；接入必须通过 client order id/权威订单查询发现真实订单，超时不能直接重发开仓单。
 - PopDEX 若广播、回执或 indexer 查询不确定，会保留 pending 并阻断新的开仓写入；若订单已成交而未进入 pending orders，仍需人工结合仓位/交易历史核验，不能把空挂单快照当作已撤单。
 - Nado 协议错误码 `REDUCE_ONLY_NOT_TAKER` 表明 reduce-only 只能做 taker；适配器拒绝 reduce-only maker 腿，保留 IOC reduce-only 平仓，不能宣称 Nado live 的长/短/回收限价腿已完全等价支持。
+- N1/Phoenix/Phoenix2 的 pending/reconcile 已通过 mock SDK/HTTP/Solana seam 验证，但没有官方 sandbox 或真实账户写入证据；上线前仍需单笔最小额度下单—查询—撤单—持仓确认。
+- Nado live 当前可安全覆盖普通 PostOnly 和 IOC reduce-only 平仓的适配器路径；现有 GridBot 的长/短模式依赖 reduce-only maker，未改变策略去迁就协议，因此只能按能力边界使用，不能标记为完整 live 网格闭环。
 - 新 live 适配器的成交事件只有在订单消失与权威持仓方向变化共同确认时才发出；单纯撤单/过期/拒单不再触发补单，但交易所人工并发交易仍是残余识别风险。
 - 外部仓库只对网格纯函数有测试；本项目五个新增适配器已通过 paper 契约测试和现有 `GridBot` 的中性/做多/做空启停测试，但仍未通过真实账户/网络的交易所集成测试。
 - `live` 模式涉及真实保证金、订单、持仓、手续费、滑点和强平；不能在没有 paper 回归和交易所官网复核的情况下操作。
