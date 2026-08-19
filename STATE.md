@@ -4,6 +4,7 @@
 
 - 2026-08-19（Asia/Shanghai）：完成 N1、Phoenix、Phoenix2、Nado、PopDEX 的 paper/live 适配器接入、服务端/AI/仪表盘注册、统一 UI 控制台和 paper 网格闭环验证；五个新增适配器已用现有 `GridBot` 完成中性/做多/做空启停测试，N1 页面完成启动/停止按钮闭环；未触发真实交易。
 - 2026-08-19（Asia/Shanghai）：继续修复 paper 行情链路；五所 paper 适配器已连接公开真实价格/K 线，服务端 `/api/n1|ph|ph2|na|pd/trend` 均实测返回 `dataSource=real`，网格策略文件哈希未变。
+- 2026-08-19（Asia/Shanghai）：完成 PopDEX live 写入闭环：严格校验 symbol 元数据与 RPC chain ID；链上 receipt、indexer 订单发现、`clientOid → orderId` 映射、带 clientOid 撤单和 pending/不重复写入保护均已覆盖本地 RPC/API 集成测试；未使用真实账户或发送主网交易。
 
 ## 当前任务
 
@@ -31,6 +32,7 @@
 
 - 外部 classic-grid 的 `VenueExecutor`/`snapshot → apply` 契约与当前 `GridBot` 的适配器契约不同；不能直接复制五个 venue 文件，必须补稳定订单 ID、reduce-only 映射和权威对账。
 - PopDEX 的链上交易回执不等于订单簿订单确认；接入必须通过 client order id/权威订单查询发现真实订单，超时不能直接重发开仓单。
+- PopDEX 若广播、回执或 indexer 查询不确定，会保留 pending 并阻断新的开仓写入；若订单已成交而未进入 pending orders，仍需人工结合仓位/交易历史核验，不能把空挂单快照当作已撤单。
 - Nado 协议错误码 `REDUCE_ONLY_NOT_TAKER` 表明 reduce-only 只能做 taker；适配器拒绝 reduce-only maker 腿，保留 IOC reduce-only 平仓，不能宣称 Nado live 的长/短/回收限价腿已完全等价支持。
 - 新 live 适配器的成交事件只有在订单消失与权威持仓方向变化共同确认时才发出；单纯撤单/过期/拒单不再触发补单，但交易所人工并发交易仍是残余识别风险。
 - 外部仓库只对网格纯函数有测试；本项目五个新增适配器已通过 paper 契约测试和现有 `GridBot` 的中性/做多/做空启停测试，但仍未通过真实账户/网络的交易所集成测试。
@@ -47,3 +49,4 @@
 - 发布审计命令本身是当前项目的重要停止条件，缺模板/忽略规则时不能把“测试通过”当作可发布。
 - 恢复/撤单相关改动必须同时看内存跟踪、交易所权威快照和异常时序，不能只看成功响应。
 - paper 行情不能再默认使用合成正弦波：统一读取器要把时间戳归一到毫秒、将远端价格送回本地撮合，并在公开接口不可用时明确降级为 `synthetic`。
+- PopDEX live 不能把交易 hash 作为 GridBot 的订单 ID；必须等权威订单接口返回可撤销的数字 orderId，撤单时优先复用原 clientOid；现有 GridBot 负责撤单连续消失和 IOC 平仓后的仓位确认。

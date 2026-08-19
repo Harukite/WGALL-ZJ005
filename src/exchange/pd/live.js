@@ -103,6 +103,14 @@ function clientOrderId(label) {
   return pad(stringToHex(String(label).slice(0, 31)), { size: 32, dir: 'right' });
 }
 
+function isNumericOrderId(value) {
+  return /^\d+$/.test(String(value ?? '').trim());
+}
+
+function isBytes32(value) {
+  return /^0x[0-9a-f]{64}$/i.test(String(value ?? '').trim());
+}
+
 function loadPrivateKey(privateKey, keyPath) {
   let raw = String(privateKey || '').trim();
   if (!raw && keyPath && fs.existsSync(keyPath)) raw = fs.readFileSync(keyPath, 'utf8').trim();
@@ -138,7 +146,15 @@ export class PopdexExchange extends LiveVenueExchange {
     this.address = '';
     this.wallet = null;
     this.pub = null;
-    this.orderGapMs = Math.max(0, Number(opts.orderGapMs || 200));
+    this.orderGapMs = Number.isFinite(Number(opts.orderGapMs)) ? Math.max(0, Number(opts.orderGapMs)) : 200;
+    this.receiptPollMs = Number.isFinite(Number(opts.receiptPollMs)) ? Math.max(0, Number(opts.receiptPollMs)) : 400;
+    this.receiptPollAttempts = Math.max(1, Math.floor(Number.isFinite(Number(opts.receiptPollAttempts)) ? Number(opts.receiptPollAttempts) : 30));
+    this.orderDiscoveryPollMs = Number.isFinite(Number(opts.orderDiscoveryPollMs)) ? Math.max(0, Number(opts.orderDiscoveryPollMs)) : 400;
+    this.orderDiscoveryAttempts = Math.max(1, Math.floor(Number.isFinite(Number(opts.orderDiscoveryAttempts)) ? Number(opts.orderDiscoveryAttempts) : 12));
+    this._pendingTransactions = new Map();
+    this._pendingOrders = new Map();
+    this._orderClientOids = new Map();
+    this._ownedOrderIds = new Set();
   }
 
   async _apiGet(pathname) {
@@ -169,13 +185,21 @@ export class PopdexExchange extends LiveVenueExchange {
     this.symbol = String(this.symbol || DEFAULT_SYMBOL).trim() || DEFAULT_SYMBOL;
     try {
       const config = await this._apiGet('/api/v1/config/symbol?symbol=' + encodeURIComponent(this.symbol) + '&category=Futures');
-      this.symbolId = Math.max(1, num(config?.symbolId, DEFAULT_SYMBOL_ID));
-      this.tickSize = num(config?.tickSize, 1) || 1;
-      this.lotSize = num(config?.lotSize, 0.0001) || 0.0001;
-      this.minQty = num(config?.minQty, this.lotSize) || this.lotSize;
-      this.minNotional = num(config?.minNotional, 10) || 10;
+      const symbolId = num(config?.symbolId, NaN);
+      const tickSize = num(config?.tickSize, NaN);
+      const lotSize = num(config?.lotSize, NaN);
+      const minQty = num(config?.minQty, NaN);
+      const minNotional = num(config?.minNotional, NaN);
+      if (!Number.isInteger(symbolId) || !(symbolId > 0) || !(tickSize > 0) || !(lotSize > 0) || !(minQty > 0) || !(minNotional > 0)) {
+        throw new Error('PopDEX symbol metadata is incomplete or invalid');
+      }
+      this.symbolId = symbolId;
+      this.tickSize = tickSize;
+      this.lotSize = lotSize;
+      this.minQty = minQty;
+      this.minNotional = minNotional;
     } catch (error) {
-      this.lastError = 'PopDEX symbol 配置读取失败，使用保守默认值：' + (error?.message || error);
+      throw new Error('PopDEX symbol metadata unavailable; refusing LIVE initialization: ' + (error?.message || error));
     }
     const account = privateKeyToAccount(loadPrivateKey(this.privateKey, this.keyPath));
     this.account = account;
@@ -185,6 +209,10 @@ export class PopdexExchange extends LiveVenueExchange {
     });
     this.wallet = createWalletClient({ account, chain: popdexChain, transport });
     this.pub = createPublicClient({ chain: popdexChain, transport });
+    const chainId = await this._rpc('eth_chainId');
+    if (Number(chainId) !== CHAIN_ID) {
+      throw new Error('PopDEX RPC chainId mismatch: expected ' + CHAIN_ID + ', got ' + chainId);
+    }
     const price = await this._mid();
     this._setMarkets([{
       marketId: 1,
@@ -218,7 +246,7 @@ export class PopdexExchange extends LiveVenueExchange {
   async _mid() {
     const rows = await this._apiGet('/api/v1/public/market/tickers?category=Futures&symbol=' + encodeURIComponent(this.symbol));
     const list = Array.isArray(rows) ? rows : [];
-    const ticker = list.find((row) => String(row.symbol || '').toUpperCase() === this.symbol.toUpperCase()) || list[0];
+    const ticker = list.find((row) => String(row.symbol || '').toUpperCase() === this.symbol.toUpperCase());
     if (!ticker) throw new Error('PopDEX 无 ticker ' + this.symbol);
     const bid = num(ticker.bid1Price), ask = num(ticker.ask1Price);
     const mark = num(ticker.markPrice), last = num(ticker.lastPrice);
@@ -263,14 +291,29 @@ export class PopdexExchange extends LiveVenueExchange {
       const remaining = num(row.remainingQty ?? row.qty);
       const price = roundToStep(row.price, this.tickSize);
       if (!(remaining > 0) || !(price > 0)) continue;
+      const orderId = String(row.orderId ?? row.order_id ?? row.id ?? '').trim();
+      const clientOid = String(row.clientOid ?? row.clientOrderId ?? '').trim();
+      const rowSymbol = row.symbol ?? row.marketSymbol;
+      if (rowSymbol != null && String(rowSymbol).trim() && String(rowSymbol).toUpperCase() !== this.symbol.toUpperCase()) {
+        throw new Error('PopDEX 返回非目标 symbol 的挂单：' + rowSymbol);
+      }
+      const rowAccount = row.account ?? row.accountAddress ?? row.address ?? row.owner;
+      if (rowAccount != null && String(rowAccount).trim() && String(rowAccount).toLowerCase() !== this.address.toLowerCase()) {
+        throw new Error('PopDEX 返回非当前账户的挂单，拒绝继续交易');
+      }
+      if (!isNumericOrderId(orderId)) {
+        throw new Error('PopDEX 返回无法安全撤销的非数字 orderId=' + (orderId || clientOid || '<empty>'));
+      }
+      if (isBytes32(clientOid)) this._orderClientOids.set(orderId, clientOid);
       openOrders.push({
-        orderId: String(row.orderId || row.clientOid || ''),
-        clientOid: String(row.clientOid || ''),
+        orderId,
+        clientOid,
         side: String(row.side || '').toLowerCase().startsWith('s') ? 'sell' : 'buy',
         price,
         sizeBase: remaining,
       });
     }
+    this._resolvePendingOrders(openOrders);
     const equity = num(overview?.accountEquity, NaN);
     return {
       price: mid,
@@ -293,7 +336,43 @@ export class PopdexExchange extends LiveVenueExchange {
     return Number(result.toFixed(8));
   }
 
-  async _send(data, gas = 500_000n) {
+  async _waitForReceipt(hash) {
+    for (let i = 0; i < this.receiptPollAttempts; i++) {
+      if (this.receiptPollMs) await sleep(this.receiptPollMs);
+      const receipt = await this.pub.getTransactionReceipt({ hash }).catch(() => null);
+      if (!receipt) continue;
+      if (receipt.status !== 'success') {
+        const error = new Error('PopDEX 交易回滚 ' + hash);
+        error.txHash = hash;
+        error.receiptKnown = true;
+        this._pendingTransactions.delete(hash);
+        throw error;
+      }
+      this._pendingTransactions.delete(hash);
+      return receipt;
+    }
+    const error = new Error('PopDEX 交易回执超时，未确认写入结果：' + hash);
+    error.pending = true;
+    error.txHash = hash;
+    throw error;
+  }
+
+  async _waitForPendingTransactions() {
+    for (const [hash, pending] of [...this._pendingTransactions]) {
+      try {
+        await this._waitForReceipt(hash);
+      } catch (error) {
+        if (error?.pending) {
+          error.message = 'PopDEX 存在未确认链上交易，拒绝继续发送新的写操作：' + hash;
+          error.kind = pending.kind;
+          throw error;
+        }
+        // A receipt-confirmed revert is known not to have changed the account.
+      }
+    }
+  }
+
+  async _send(data, gas = 500_000n, meta = {}) {
     if (!this.wallet || !this.pub || !this.account) throw new Error('PopDEX 未连接');
     const hash = await this.wallet.sendTransaction({
       to: ORDER_CONTRACT,
@@ -302,27 +381,39 @@ export class PopdexExchange extends LiveVenueExchange {
       gas,
       gasPrice: 0n,
     });
-    for (let i = 0; i < 30; i++) {
-      await sleep(400);
-      const receipt = await this.pub.getTransactionReceipt({ hash }).catch(() => null);
-      if (!receipt) continue;
-      if (receipt.status !== 'success') throw new Error('PopDEX 交易回滚 ' + hash);
-      return hash;
+    this._pendingTransactions.set(hash, { ...meta, hash, submittedAt: Date.now() });
+    await this._waitForReceipt(hash);
+    return hash;
+  }
+
+  _matchPlacedOrder(openOrders, order, clientOid, previousIds = new Set(), excludedIds = new Set()) {
+    const exact = openOrders.find((row) => String(row.clientOid || '') === String(clientOid) && !excludedIds.has(String(row.orderId)));
+    if (exact) return exact;
+    const candidates = openOrders
+      .filter((row) => !previousIds.has(String(row.orderId)) && !excludedIds.has(String(row.orderId)))
+      .filter((row) => row.side === order.side && Math.abs(row.price - order.price) <= this.tickSize)
+      .filter((row) => Math.abs(Number(row.sizeBase) - Number(order.sizeBase)) <= Math.max(this.lotSize, Number(order.sizeBase) * 0.01));
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+
+  _resolvePendingOrders(openOrders) {
+    const claimed = new Set();
+    for (const [clientOid, pending] of this._pendingOrders) {
+      const placed = this._matchPlacedOrder(openOrders, pending.order, clientOid, pending.previousIds, claimed);
+      if (!placed?.orderId) continue;
+      claimed.add(String(placed.orderId));
+      this._orderClientOids.set(String(placed.orderId), isBytes32(placed.clientOid) ? placed.clientOid : clientOid);
+      this._ownedOrderIds.add(String(placed.orderId));
+      this._pendingOrders.delete(clientOid);
     }
-    throw new Error('PopDEX 交易回执超时，未确认写入结果：' + hash);
   }
 
   async _findPlacedOrder(order, clientOid, previousIds = new Set()) {
-    for (let attempt = 0; attempt < 12; attempt++) {
+    for (let attempt = 0; attempt < this.orderDiscoveryAttempts; attempt++) {
       const snapshot = await this._refreshMarket(order.marketId);
-      const exact = snapshot.openOrders.find((row) => String(row.clientOid || '') === String(clientOid));
-      const candidates = snapshot.openOrders
-        .filter((row) => !previousIds.has(String(row.orderId)))
-        .filter((row) => row.side === order.side && Math.abs(row.price - order.price) <= this.tickSize)
-        .filter((row) => Math.abs(Number(row.sizeBase) - Number(order.sizeBase)) <= Math.max(this.lotSize, Number(order.sizeBase) * 0.01));
-      if (exact) return exact;
-      if (candidates.length === 1) return candidates[0];
-      await sleep(400);
+      const placed = this._matchPlacedOrder(snapshot.openOrders, order, clientOid, previousIds);
+      if (placed) return placed;
+      if (attempt + 1 < this.orderDiscoveryAttempts && this.orderDiscoveryPollMs) await sleep(this.orderDiscoveryPollMs);
     }
     return null;
   }
@@ -331,7 +422,15 @@ export class PopdexExchange extends LiveVenueExchange {
     const price = roundToStep(order.price, this.tickSize);
     const size = this._roundSize(order.sizeBase, price);
     if (!(price > 0) || !(size >= this.minQty)) throw new Error('PopDEX 订单精度或数量不足');
+    await this._waitForPendingTransactions();
     const before = await this._refreshMarket(1);
+    if (this._pendingOrders.size) {
+      const pendingOid = this._pendingOrders.keys().next().value;
+      const error = new Error('PopDEX 存在尚未完成真实订单发现，拒绝继续发送开仓单');
+      error.pending = true;
+      error.clientOid = pendingOid;
+      throw error;
+    }
     const liveMid = Number(before.price) || await this._mid();
     if ((order.side === 'sell' && price <= liveMid) || (order.side === 'buy' && price >= liveMid)) {
       throw new Error('PopDEX PostOnly 订单穿价，等待下一轮行情');
@@ -359,11 +458,40 @@ export class PopdexExchange extends LiveVenueExchange {
         0n,
       ],
     });
-    await this._send(data);
     const previousIds = new Set(before.openOrders.map((row) => String(row.orderId)));
-    const placed = await this._findPlacedOrder({ ...order, marketId: 1, price, sizeBase: size }, oid, previousIds);
-    if (!placed?.orderId) throw new Error('PopDEX 交易已确认但 indexer 暂未发现真实订单，停止自动重发');
-    return this._registerPlaced(placed.orderId, { ...order, price: placed.price, sizeBase: placed.sizeBase });
+    const pending = {
+      clientOid: oid,
+      order: { ...order, marketId: 1, price, sizeBase: size },
+      previousIds,
+      txHash: null,
+      submittedAt: Date.now(),
+    };
+    this._pendingOrders.set(oid, pending);
+    try {
+      pending.txHash = await this._send(data, 500_000n, { kind: 'place', clientOid: oid });
+      const placed = await this._findPlacedOrder(pending.order, oid, previousIds);
+      if (!placed?.orderId) {
+        const error = new Error('PopDEX 交易已确认但 indexer 暂未发现真实订单，停止自动重发');
+        error.pending = true;
+        error.clientOid = oid;
+        error.txHash = pending.txHash;
+        throw error;
+      }
+      this._pendingOrders.delete(oid);
+      this._orderClientOids.set(String(placed.orderId), isBytes32(placed.clientOid) ? placed.clientOid : oid);
+      this._ownedOrderIds.add(String(placed.orderId));
+      return this._registerPlaced(placed.orderId, { ...order, price: placed.price, sizeBase: placed.sizeBase });
+    } catch (error) {
+      if (error?.receiptKnown) {
+        this._pendingOrders.delete(oid);
+      } else {
+        pending.txHash = pending.txHash || error?.txHash || null;
+        error.pending = true;
+        error.clientOid = error.clientOid || oid;
+        error.txHash = error.txHash || pending.txHash;
+      }
+      throw error;
+    }
   }
 
   async placeLimitOrders(orders) {
@@ -373,18 +501,26 @@ export class PopdexExchange extends LiveVenueExchange {
   }
 
   async cancelOrder(marketId, orderId) {
-    if (!/^\d+$/.test(String(orderId))) throw new Error('PopDEX 无效 orderId=' + orderId);
+    if (!isNumericOrderId(orderId)) throw new Error('PopDEX 无效 orderId=' + orderId);
+    await this._waitForPendingTransactions();
+    const knownClientOid = this._orderClientOids.get(String(orderId));
+    if (this._ownedOrderIds.has(String(orderId)) && !isBytes32(knownClientOid)) {
+      throw new Error('PopDEX 缺少自有订单的 clientOid，拒绝发送不完整撤单请求：' + orderId);
+    }
     const data = encodeFunctionData({
       abi: cancelAbi,
       functionName: 'cancelOrder',
-      args: [this.address, BigInt(String(orderId)), pad('0x', { size: 32 })],
+      args: [this.address, BigInt(String(orderId)), isBytes32(knownClientOid) ? knownClientOid : pad('0x', { size: 32 })],
     });
-    await this._send(data, 300_000n);
+    await this._send(data, 300_000n, { kind: 'cancel', orderId: String(orderId) });
     this._markCancelled(orderId);
+    this._orderClientOids.delete(String(orderId));
+    this._ownedOrderIds.delete(String(orderId));
     return true;
   }
 
   async cancelAll(marketId) {
+    await this._waitForPendingTransactions();
     const data = encodeFunctionData({
       abi: cancelAllAbi,
       functionName: 'cancelAllOrders',
@@ -396,12 +532,13 @@ export class PopdexExchange extends LiveVenueExchange {
         { isSome: false, value: false },
       ],
     });
-    await this._send(data, 400_000n);
+    await this._send(data, 400_000n, { kind: 'cancelAll', marketId });
     this._markMarketCancelled(marketId);
     return true;
   }
 
   async closePosition(marketId) {
+    await this._waitForPendingTransactions();
     const snapshot = await this._refreshMarket(marketId);
     const position = Number(snapshot.position?.sizeBase || 0);
     if (!position) return true;
@@ -428,7 +565,7 @@ export class PopdexExchange extends LiveVenueExchange {
         0n,
       ],
     });
-    await this._send(data);
+    await this._send(data, 500_000n, { kind: 'closePosition', clientOid: oid });
     return true;
   }
 }

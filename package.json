@@ -8,9 +8,10 @@
     "start": "node src/server.js",
     "check:config": "node scripts/preflight.js",
     "audit:release": "node scripts/release-audit.js",
-    "test": "node test/config.test.js && node test/grid.test.js && node test/cancel-safety.test.js && node test/arcus.test.js && node test/live-adapter-safety.test.js && node test/ui.test.js && node test/new-exchange.test.js && node test/real-market-data.test.js && node test/lighter.test.js && node test/overview.test.js",
+    "test": "node test/config.test.js && node test/grid.test.js && node test/cancel-safety.test.js && node test/arcus.test.js && node test/live-adapter-safety.test.js && node test/popdex-live.test.js && node test/ui.test.js && node test/new-exchange.test.js && node test/real-market-data.test.js && node test/lighter.test.js && node test/overview.test.js",
     "test:ui": "node test/ui.test.js",
-    "test:new-exchanges": "node test/new-exchange.test.js"
+    "test:new-exchanges": "node test/new-exchange.test.js",
+    "test:popdex-live": "node test/popdex-live.test.js"
   },
   "engines": {
     "node": ">=20"
