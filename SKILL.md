@@ -52,3 +52,4 @@
 - 2026-08-19：五个新增交易所已通过 paper 适配器与现有 `GridBot` 的中性/做多/做空启停闭环；实盘写操作保持交易所各自的精度、reduce-only、权威订单确认和 fail-closed 约束。Phoenix 的市场筛选和 Nado 的链环境必须由配置实际驱动，不能只在 `.env.example` 中声明。
 - 2026-08-19：Nado SDK 明确拒绝 post-only + reduce-only（`REDUCE_ONLY_NOT_TAKER`）；遇到宿主策略要求的 reduce-only maker 腿必须失败关闭，不能偷偷降级为普通开仓单。
 - 2026-08-19：新增交易所的前端必须复用 `makeExchangeCtrl` 和既有控制台布局；独立紧凑面板会造成趋势、风险、补格、恢复和账户监控能力不一致，禁止再引入第二套 venue 控制器。
+- 2026-08-19：paper 模式的真实行情应通过交易所公开只读接口读取，价格更新仍调用宿主 paper 的本地 `setPrice`/撮合路径；网络失败必须保留合成回退并标记 `synthetic`。N1 当前公开历史接口只有 hourly snapshot，不能把它宣称成任意周期的原生 OHLC。

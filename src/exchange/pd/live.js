@@ -13,6 +13,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { LiveVenueExchange, num, roundToStep, sleep } from '../common/live.js';
+import { fetchPopdexCandles } from './market-data.js';
 
 const DEFAULT_API = 'https://api.popdex.xyz';
 const ORDER_CONTRACT = '0x0000000000000000000000000000000000001000';
@@ -224,6 +225,15 @@ export class PopdexExchange extends LiveVenueExchange {
     const mid = bid > 0 && ask > 0 ? (bid + ask) / 2 : mark > 0 ? mark : last;
     if (!(mid > 0)) throw new Error('PopDEX 返回无效 mid');
     return mid;
+  }
+
+  async getCandles(marketId, intervalSec = 3600, count = 200) {
+    return fetchPopdexCandles({
+      apiUrl: this.apiUrl,
+      symbol: this.symbol,
+      intervalSec,
+      count,
+    });
   }
 
   async _refreshMarket(_marketId) {

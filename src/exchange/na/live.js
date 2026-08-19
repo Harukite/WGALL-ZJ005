@@ -14,6 +14,7 @@ import {
 import { createPublicClient, createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { LiveVenueExchange, num, roundToStep, sleep } from '../common/live.js';
+import { fetchNadoCandles } from './market-data.js';
 
 const CHAIN_ENV_BY_NETWORK = {
   'ink-mainnet': 'inkMainnet',
@@ -99,6 +100,15 @@ export class NadoExchange extends LiveVenueExchange {
   _ensure() {
     if (!this.client || !this.address) throw new Error('Nado 实盘未连接');
     return this.client;
+  }
+
+  async getCandles(marketId, intervalSec = 3600, count = 200) {
+    return fetchNadoCandles({
+      exchange: this,
+      market: this.markets.get(Number(marketId)),
+      intervalSec,
+      count,
+    });
   }
 
   async _mid() {

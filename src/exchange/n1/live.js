@@ -4,6 +4,7 @@ import path from 'node:path';
 import { FillMode, Nord, NordUser, Side, calcCurrPosLiqPrice } from '@n1xyz/nord-ts';
 import { Connection } from '@solana/web3.js';
 import { LiveVenueExchange, num } from '../common/live.js';
+import { fetchN1Candles } from './market-data.js';
 
 const DEFAULT_APP = 'zoau54n5U24GHNKqyoziVaVxgsiQYnPMx33fKmLLCT5';
 const DEFAULT_API = 'https://zo-mainnet.n1.xyz';
@@ -112,6 +113,15 @@ export class N1Exchange extends LiveVenueExchange {
 
   _ensure() {
     if (!this.nord || !this.user || this.accountId == null) throw new Error('N1 未连接');
+  }
+
+  async getCandles(marketId, intervalSec = 3600, count = 200) {
+    return fetchN1Candles({
+      apiUrl: this.apiUrl,
+      remoteMarketId: this._remoteMarketId,
+      intervalSec,
+      count,
+    });
   }
 
   async _ensureSession() {

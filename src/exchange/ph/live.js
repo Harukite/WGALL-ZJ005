@@ -16,6 +16,7 @@ import {
   createPhoenixClient,
 } from '@ellipsis-labs/rise';
 import { LiveVenueExchange, num, sleep } from '../common/live.js';
+import { fetchPhoenixCandles } from './market-data.js';
 
 const DEFAULT_API = 'https://perp-api.phoenix.trade';
 const DEFAULT_RPC = 'https://api.mainnet-beta.solana.com';
@@ -156,6 +157,15 @@ export class PhoenixExchange extends LiveVenueExchange {
     const symbol = this.symbolByMarket.get(Number(marketId));
     if (!symbol) throw new Error(this.id + ' 未知市场 marketId=' + marketId);
     return symbol;
+  }
+
+  async getCandles(marketId, intervalSec = 3600, count = 200) {
+    return fetchPhoenixCandles({
+      apiUrl: this.apiUrl,
+      symbol: this._symbolForMarket(marketId),
+      intervalSec,
+      count,
+    });
   }
 
   async _sendIxs(ixs) {

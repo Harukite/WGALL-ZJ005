@@ -23,6 +23,7 @@ for (const [key, factory] of factories) {
     mode: 'paper',
     tickMs: 60_000,
     marketPrice: 100,
+    realMarketData: false,
   });
   await ex.init();
   const markets = await ex.getMarkets();
