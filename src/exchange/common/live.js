@@ -37,7 +37,7 @@ export async function fetchJson(url, options = {}) {
   return body;
 }
 
-function stableId(value) {
+export function stableId(value) {
   if (value == null) return null;
   const text = String(value).trim();
   if (!text || /^(undefined|null|nan|\[object object\])$/i.test(text)) return null;
@@ -367,7 +367,22 @@ export class LiveVenueExchange extends EventEmitter {
       ? 0
       : Number(typeof snapshot.position === 'object' ? snapshot.position.sizeBase : snapshot.position);
     for (const [writeId, write] of [...this._pendingWrites]) {
-      if (write.kind === 'place' || (write.marketId != null && Number(write.marketId) !== id)) continue;
+      if (write.marketId != null && Number(write.marketId) !== id) continue;
+      if (write.kind === 'place') {
+        const orderId = stableId(write.orderId);
+        const remote = orderId && snapshot.openOrders.find((order) => stableId(order.orderId ?? order.id) === orderId);
+        if (remote) {
+          this._finishPendingWrite(write);
+          if (write.order) {
+            this._registerPlaced(orderId, {
+              ...write.order,
+              price: Number(remote.price ?? write.order.price),
+              sizeBase: Number(remote.sizeBase ?? remote.size ?? write.order.sizeBase),
+            });
+          }
+        }
+        continue;
+      }
       let converged = false;
       if (write.kind === 'cancel') converged = !openIds.has(stableId(write.orderId));
       else if (write.kind === 'cancelAll') {

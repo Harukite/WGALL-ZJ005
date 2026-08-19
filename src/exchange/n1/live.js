@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { FillMode, Nord, NordUser, Side, calcCurrPosLiqPrice } from '@n1xyz/nord-ts';
 import { Connection } from '@solana/web3.js';
-import { LiveVenueExchange, num } from '../common/live.js';
+import { LiveVenueExchange, num, stableId } from '../common/live.js';
 import { fetchN1Candles } from './market-data.js';
 
 const DEFAULT_APP = 'zoau54n5U24GHNKqyoziVaVxgsiQYnPMx33fKmLLCT5';
@@ -165,8 +165,8 @@ export class N1Exchange extends LiveVenueExchange {
       .filter((row) => Number(row.marketId) === this._remoteMarketId)
       .map((row) => {
         const rawOrderId = row.orderId ?? row.id;
-        const orderId = String(rawOrderId ?? '').trim();
-        if (!orderId || /^(undefined|null|nan|\[object object\])$/i.test(orderId)) {
+        const orderId = stableId(rawOrderId);
+        if (!orderId) {
           throw new Error('N1 权威挂单快照缺少稳定 orderId，拒绝继续交易');
         }
         return {
@@ -218,6 +218,8 @@ export class N1Exchange extends LiveVenueExchange {
     this._assertNoPendingPlacements('下单');
     if (!this.tradingArmed) throw new Error('N1 实盘下单未授权：设置 N1_TRADING_ARMED=YES');
     await this._ensureSession();
+    const before = await this._refreshMarket(order.marketId);
+    this._applySnapshot(order.marketId, before);
     const remoteClientOrderId = clientOrderId('grid:' + order.side + ':' + order.levelIndex + ':' + order.clientOrderId);
     const pending = this._beginPendingPlacement({
       ...order,
@@ -234,8 +236,10 @@ export class N1Exchange extends LiveVenueExchange {
         accountId: this.accountId,
         clientOrderId: remoteClientOrderId,
       });
-      const orderId = receipt?.orderId ?? receipt?.id;
-      if (orderId == null || /^(undefined|null|nan|\[object object\])$/i.test(String(orderId).trim())) {
+      const orderId = receipt?.orderId
+        ?? receipt?.id
+        ?? receipt?.fills?.find?.((fill) => fill?.orderId != null)?.orderId;
+      if (!stableId(orderId)) {
         throw this._pendingPlacementError(
           new Error('N1 下单回执缺少稳定 orderId'),
           pending,
@@ -285,9 +289,9 @@ export class N1Exchange extends LiveVenueExchange {
     await this._ensureSession();
     const rows = (this.user.orders?.[String(this.accountId)] || [])
       .filter((row) => Number(row.marketId) === this._remoteMarketId);
-    const orderIds = rows.map((row) => String(row.orderId ?? row.id ?? '').trim());
+    const orderIds = rows.map((row) => stableId(row.orderId ?? row.id));
     for (const orderId of orderIds) {
-      if (!orderId || /^(undefined|null|nan|\[object object\])$/i.test(orderId)) {
+      if (!orderId) {
         throw new Error('N1 撤单快照缺少稳定 orderId，拒绝继续撤单');
       }
     }

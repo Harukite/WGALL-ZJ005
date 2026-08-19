@@ -6,6 +6,7 @@
 - 2026-08-19（Asia/Shanghai）：继续修复 paper 行情链路；五所 paper 适配器已连接公开真实价格/K 线，服务端 `/api/n1|ph|ph2|na|pd/trend` 均实测返回 `dataSource=real`，网格策略文件哈希未变。
 - 2026-08-19（Asia/Shanghai）：完成 PopDEX live 写入闭环：严格校验 symbol 元数据与 RPC chain ID；链上 receipt、indexer 订单发现、`clientOid → orderId` 映射、带 clientOid 撤单和 pending/不重复写入保护均已覆盖本地 RPC/API 集成测试；未使用真实账户或发送主网交易。
 - 2026-08-19（Asia/Shanghai）：补齐 N1、Phoenix、Phoenix2 live 的稳定 client order id、权威订单发现和 pending/reconcile；Solana/N1 写结果不确定时阻断后续写操作，撤单/平仓未知结果等待连续权威快照收敛。新增 `test/live-new-exchange-lifecycle.test.js` 覆盖三所成功与延迟发现路径；未使用真实账户或发送真实订单。
+- 2026-08-19（Asia/Shanghai）：进一步补齐 Nado 普通 PostOnly 的 digest→权威挂单发现、空/失败写响应保护，并加入 N1 session 刷新、Phoenix 确认超时和 Nado 普通下单—查询—撤单 mock 测试；Nado reduce-only maker 仍明确拒绝。
 
 ## 当前任务
 

@@ -56,3 +56,4 @@
 - 2026-08-19：PopDEX live 的链上交易回执必须与 indexer 订单确认分开建模；下单后以 `clientOid → orderId` pending 映射收敛，撤单复用已确认的 `clientOid`，回执或订单发现不确定时禁止新的写入和自动重发。
 - 2026-08-19：N1/Phoenix/Phoenix2 的 live 写入统一要求 stable client order id；回执、Solana 确认或权威挂单发现不确定时必须留在 pending，后续只接受精确 client id 的权威快照收敛，不允许用价格/数量模糊匹配重发。
 - 2026-08-19：Nado 的 reduce-only maker 仍不能由协议表达；应保留普通 PostOnly 与 IOC reduce-only 平仓能力，拒绝把 reduce-only 限价腿降级为普通开仓单，并对未知 network、digest 缺失和失败 IOC 结果 fail-closed。
+- 2026-08-19：Nado 普通 PostOnly 也必须经过 digest → 权威挂单查询后才能写入 active；SDK 返回空/非 success 的撤单、撤全或 IOC 响应不得当作成功。

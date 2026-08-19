@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Keypair } from '@solana/web3.js';
 import { N1Exchange } from '../src/exchange/n1/live.js';
 import { PhoenixExchange } from '../src/exchange/ph/live.js';
 import { Phoenix2Exchange } from '../src/exchange/ph2/live.js';
@@ -119,6 +120,20 @@ assert.equal(n1Pending.ex._pendingPlacements.size, 0, 'N1 must resolve pending p
 assert.equal(n1Pending.ex.getOpenOrders(1)[0].orderId, '202');
 n1Pending.ex.stop();
 
+const n1Session = new N1Exchange({ pollMs: 500 });
+let sessionRefreshes = 0;
+n1Session.nord = {};
+n1Session.accountId = 7;
+n1Session.user = {
+  refreshSession: async () => { sessionRefreshes++; },
+};
+n1Session.sessionExpiresAt = 0;
+await n1Session._ensureSession();
+assert.equal(sessionRefreshes, 1, 'N1 must refresh an expired session before writing');
+await n1Session._ensureSession();
+assert.equal(sessionRefreshes, 1, 'N1 must reuse a still-valid session');
+n1Session.stop();
+
 for (const [Venue, venue] of [[PhoenixExchange, 'ph'], [Phoenix2Exchange, 'ph2']]) {
   const harness = makePhoenixHarness(Venue, venue);
   const placed = await harness.ex.placeLimitOrder(order);
@@ -153,6 +168,22 @@ for (const [Venue, venue] of [[PhoenixExchange, 'ph'], [Phoenix2Exchange, 'ph2']
   pending.ex.stop();
 }
 
+const phoenixTimeout = new PhoenixExchange({ venue: 'ph', computeUnitLimit: 200_000 });
+phoenixTimeout.client = {};
+phoenixTimeout.kp = Keypair.generate();
+phoenixTimeout.authority = phoenixTimeout.kp.publicKey.toBase58();
+phoenixTimeout.conn = {
+  getLatestBlockhash: async () => ({ blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 1 }),
+  sendTransaction: async () => 'signature-timeout',
+  confirmTransaction: async () => { throw new Error('confirmation timeout'); },
+};
+await assert.rejects(
+  phoenixTimeout._sendIxs([]),
+  (error) => error?.pending === true && error?.txSignature === 'signature-timeout',
+  'Phoenix confirmation timeout must remain pending with its transaction signature',
+);
+phoenixTimeout.stop();
+
 assert.throws(
   () => new NadoExchange({ network: 'unknown-network' }),
   /不支持 network|拒绝 LIVE/,
@@ -178,6 +209,55 @@ await assert.rejects(
   /digest|稳定订单 ID/,
   'Nado must reject an authoritative order snapshot without a digest',
 );
+
+const nado = new NadoExchange({
+  network: 'ink-testnet',
+  orderDiscoveryAttempts: 1,
+  orderDiscoveryPollMs: 0,
+});
+const nadoState = { open: false, placeCalls: 0, cancelCalls: 0 };
+nado.address = '0x0000000000000000000000000000000000000001';
+nado.client = {
+  market: {
+    getLatestMarketPrice: async () => ({ bid: 99, ask: 101 }),
+    getOpenSubaccountOrders: async () => ({
+      orders: nadoState.open ? [{ digest: 'digest-1', unfilledAmount: 0.00005, price: 99 }] : [],
+    }),
+    placeOrder: async () => {
+      nadoState.placeCalls++;
+      nadoState.open = true;
+      return { status: 'success', data: { digest: 'digest-1' }, signature: 'sig' };
+    },
+    cancelOrders: async () => {
+      nadoState.cancelCalls++;
+      nadoState.open = false;
+      return { status: 'success', data: { cancelled_orders: [] }, signature: 'sig' };
+    },
+  },
+  subaccount: {
+    getSubaccountSummary: async () => ({ balances: [], health: {} }),
+  },
+};
+nado._mid = async () => 100;
+const nadoPlaced = await nado.placeLimitOrder({ ...order, sizeBase: 0.00005 });
+assert.equal(nadoPlaced.orderId, 'digest-1', 'Nado must return the digest only after authority confirms the order');
+assert.equal(nadoState.placeCalls, 1);
+await nado.cancelOrder(1, nadoPlaced.orderId);
+assert.deepEqual(await nado.fetchOpenOrders(1), [], 'Nado cancellation must converge on the authoritative snapshot');
+assert.equal(nadoState.cancelCalls, 1);
+nado.stop();
+
+const nadoUnknown = new NadoExchange({ network: 'ink-testnet' });
+nadoUnknown.address = '0x0000000000000000000000000000000000000001';
+nadoUnknown._refreshMarket = async () => ({ price: 100, position: null, openOrders: [] });
+nadoUnknown.client = { market: { placeOrder: async () => undefined } };
+await assert.rejects(
+  nadoUnknown.placeLimitOrder({ ...order, sizeBase: 0.00005 }),
+  (error) => error?.pending === true,
+  'Nado must keep an empty write response pending',
+);
+assert.equal(nadoUnknown._pendingWrites.size, 1);
+nadoUnknown.stop();
 
 const nadoClose = new NadoExchange({ network: 'ink-testnet' });
 nadoClose.address = '0x0000000000000000000000000000000000000001';

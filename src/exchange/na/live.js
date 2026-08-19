@@ -13,7 +13,7 @@ import {
 } from '@nadohq/shared';
 import { createPublicClient, createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { LiveVenueExchange, num, roundToStep, sleep } from '../common/live.js';
+import { LiveVenueExchange, num, roundToStep, sleep, stableId } from '../common/live.js';
 import { fetchNadoCandles } from './market-data.js';
 
 const CHAIN_ENV_BY_NETWORK = {
@@ -49,6 +49,14 @@ function chainEnvFor(network) {
   return chainEnv;
 }
 
+function requireExecutionSuccess(result, action) {
+  if (result?.status === 'success') return;
+  const error = new Error('Nado ' + action + '结果未知：' + (result?.error || '缺少 success 状态'));
+  error.receiptKnown = result?.status === 'failure';
+  if (error.receiptKnown) error.message = 'Nado ' + action + '失败：' + (result.error || '未知错误');
+  throw error;
+}
+
 export class NadoExchange extends LiveVenueExchange {
   constructor(opts = {}) {
     super({
@@ -63,6 +71,8 @@ export class NadoExchange extends LiveVenueExchange {
     this.keyPath = opts.keyPath || path.resolve(process.cwd(), 'secrets', 'nado.key');
     this.subaccountName = String(opts.subaccount || 'default').trim() || 'default';
     this.productId = Math.max(1, Number(opts.productId || DEFAULT_PRODUCT_ID));
+    this.orderDiscoveryPollMs = Math.max(0, Number(opts.orderDiscoveryPollMs ?? 300));
+    this.orderDiscoveryAttempts = Math.max(1, Math.floor(Number(opts.orderDiscoveryAttempts ?? 6)));
     this.client = null;
     this.address = '';
     this.chain = null;
@@ -172,8 +182,8 @@ export class NadoExchange extends LiveVenueExchange {
       if (!unfilled) continue;
       const price = roundToStep(humanAmount(order.price) || num(order.price), PRICE_INC);
       if (!(price > 0)) continue;
-      const digest = String(order.digest ?? '').trim();
-      if (!digest || /^(undefined|null|nan|\[object object\])$/i.test(digest)) {
+      const digest = stableId(order.digest);
+      if (!digest) {
         throw new Error('Nado 权威挂单快照缺少稳定 digest，拒绝继续交易');
       }
       openOrders.push({
@@ -197,6 +207,18 @@ export class NadoExchange extends LiveVenueExchange {
     return false;
   }
 
+  async _findPlacedOrder(marketId, orderId) {
+    for (let attempt = 0; attempt < this.orderDiscoveryAttempts; attempt++) {
+      const snapshot = await this._refreshMarket(marketId);
+      const placed = snapshot.openOrders.find((row) => String(row.orderId) === String(orderId));
+      if (placed) return placed;
+      if (attempt + 1 < this.orderDiscoveryAttempts && this.orderDiscoveryPollMs) {
+        await sleep(this.orderDiscoveryPollMs);
+      }
+    }
+    return null;
+  }
+
   async placeLimitOrder(order) {
     const client = this._ensure();
     this._assertNoPendingPlacements('下单');
@@ -206,15 +228,18 @@ export class NadoExchange extends LiveVenueExchange {
     const price = roundToStep(order.price, PRICE_INC);
     const size = roundToStep(order.sizeBase, SIZE_INC, 'down');
     if (!(price > 0) || !(size >= SIZE_INC)) throw new Error('Nado 订单精度或数量不足');
-    const liveMid = await this._mid();
+    const before = await this._refreshMarket(order.marketId);
+    const liveMid = Number(before.price) || await this._mid();
     if ((order.side === 'sell' && price <= liveMid) || (order.side === 'buy' && price >= liveMid)) {
       throw new Error('Nado PostOnly 订单穿价，等待下一轮行情');
     }
     const signedAmount = order.side === 'buy' ? addDecimals(size) : addDecimals(-size);
+    const placedOrder = { ...order, marketId: Number(order.marketId), price, sizeBase: size };
     const write = this._beginPendingWrite('place', {
       marketId: Number(order.marketId),
       price,
       sizeBase: size,
+      order: placedOrder,
     });
     try {
       const result = await client.market.placeOrder({
@@ -230,12 +255,7 @@ export class NadoExchange extends LiveVenueExchange {
           }),
         },
       });
-      if (result?.status === 'failure') {
-        this._finishPendingWrite(write);
-        const error = new Error('Nado 下单失败：' + (result.error || '未知错误'));
-        error.receiptKnown = true;
-        throw error;
-      }
+      requireExecutionSuccess(result, '下单');
       const directId = result?.data?.digest ?? result?.digest ?? result?.orderId ?? result?.id;
       if (!directId) {
         const error = new Error('Nado 下单回执缺少 digest，结果未知，等待人工/权威核验');
@@ -243,13 +263,29 @@ export class NadoExchange extends LiveVenueExchange {
         error.writeId = write.id;
         throw error;
       }
-      const placed = this._registerPlaced(String(directId), { ...order, price, sizeBase: size });
+      write.orderId = String(directId);
+      const authoritative = await this._findPlacedOrder(order.marketId, write.orderId);
+      if (!authoritative) {
+        const error = new Error('Nado 交易已确认但权威挂单列表暂未发现 digest=' + write.orderId);
+        error.pending = true;
+        error.writeId = write.id;
+        throw error;
+      }
+      const placed = this._registerPlaced(write.orderId, {
+        ...placedOrder,
+        price: authoritative.price,
+        sizeBase: authoritative.sizeBase,
+      });
       this._finishPendingWrite(write);
       return placed;
     } catch (error) {
-      if (!error?.pending && !error?.receiptKnown) {
+      if (error?.receiptKnown) {
+        this._finishPendingWrite(write);
+      } else if (!error?.pending) {
         error.pending = true;
         error.writeId = write.id;
+      } else {
+        error.writeId = error.writeId || write.id;
       }
       throw error;
     }
@@ -266,15 +302,19 @@ export class NadoExchange extends LiveVenueExchange {
     this._assertNoPendingPlacements('撤单');
     const write = this._beginPendingWrite('cancel', { marketId: Number(marketId), orderId: String(orderId) });
     try {
-      await client.market.cancelOrders({
+      const result = await client.market.cancelOrders({
         digests: [String(orderId)],
         productIds: [this.productId],
         subaccountName: this.subaccountName,
       });
+      requireExecutionSuccess(result, '撤单');
       this._finishPendingWrite(write);
     } catch (error) {
-      error.pending = true;
-      error.writeId = write.id;
+      if (error?.receiptKnown) this._finishPendingWrite(write);
+      else {
+        error.pending = true;
+        error.writeId = write.id;
+      }
       throw error;
     }
     this._markCancelled(orderId);
@@ -288,14 +328,18 @@ export class NadoExchange extends LiveVenueExchange {
     const orderIds = before.openOrders.map((order) => String(order.orderId));
     const write = this._beginPendingWrite('cancelAll', { marketId: Number(marketId), orderIds });
     try {
-      await client.market.cancelProductOrders({
+      const result = await client.market.cancelProductOrders({
         productIds: [this.productId],
         subaccountName: this.subaccountName,
       });
+      requireExecutionSuccess(result, '撤销全部挂单');
       this._finishPendingWrite(write);
     } catch (error) {
-      error.pending = true;
-      error.writeId = write.id;
+      if (error?.receiptKnown) this._finishPendingWrite(write);
+      else {
+        error.pending = true;
+        error.writeId = write.id;
+      }
       throw error;
     }
     this._markMarketCancelled(marketId);
@@ -323,17 +367,15 @@ export class NadoExchange extends LiveVenueExchange {
           appendix: packOrderAppendix({ orderExecutionType: 'ioc', reduceOnly: true }),
         },
       });
-      if (result?.status === 'failure' || result?.data?.status === 'failure') {
-        this._finishPendingWrite(write);
-        const error = new Error('Nado 平仓失败：' + (result.error || result.data?.error || '未知错误'));
-        error.receiptKnown = true;
-        throw error;
-      }
+      requireExecutionSuccess(result, '平仓');
       this._finishPendingWrite(write);
     } catch (error) {
-      if (!error?.pending && !error?.receiptKnown) {
+      if (error?.receiptKnown) this._finishPendingWrite(write);
+      else if (!error?.pending) {
         error.pending = true;
         error.writeId = write.id;
+      } else {
+        error.writeId = error.writeId || write.id;
       }
       throw error;
     }
