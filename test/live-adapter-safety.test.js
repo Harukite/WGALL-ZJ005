@@ -45,7 +45,7 @@ assert.equal(partialFills[0].sizeBase, 0.4);
 
 const cachedOutcome = new LiveVenueExchange({ venue: 'cached-outcome-test', pollMs: 500 });
 const cachedPending = cachedOutcome._beginPendingPlacement(
-  { marketId: 1, side: 'buy', price: 99, sizeBase: 1 },
+  { marketId: 1, side: 'buy', price: 99, sizeBase: 1, clientOrderId: 'cached-client-1' },
   'cached-client-1',
 );
 assert.equal(cachedOutcome._markPendingPlacementFilled(cachedPending, {
@@ -59,12 +59,17 @@ assert.doesNotThrow(
   'a resolved fill cache must not block an unrelated grid write',
 );
 assert.equal(
-  cachedOutcome._takePendingPlacementOutcome({ marketId: 1, side: 'buy', price: 99, sizeBase: 2 }),
+  cachedOutcome._takePendingPlacementOutcome({ marketId: 1, side: 'buy', price: 99, sizeBase: 2, clientOrderId: 'cached-client-1' }),
   null,
   'a different order size must not consume a cached fill outcome',
 );
-assert.deepEqual(
+assert.equal(
   cachedOutcome._takePendingPlacementOutcome({ marketId: 1, side: 'buy', price: 99, sizeBase: 1 }),
+  null,
+  'an order without a stable client id must not consume a cached fill outcome',
+);
+assert.deepEqual(
+  cachedOutcome._takePendingPlacementOutcome({ marketId: 1, side: 'buy', price: 99, sizeBase: 1, clientOrderId: 'cached-client-1' }),
   { orderId: 'cached-fill-1', price: 99, sizeBase: 1, filled: true },
   'the same order must still consume its cached fill outcome without resubmitting',
 );

@@ -407,6 +407,8 @@ export class PhoenixExchange extends LiveVenueExchange {
 
   async placeLimitOrder(order) {
     this._ensure();
+    const requestedClientOrderId = stableId(order.clientOrderId);
+    if (!requestedClientOrderId) throw new Error(this.id + ' 下单缺少稳定 clientOrderId');
     const resolved = this._takePendingPlacementOutcome(order);
     if (resolved) return resolved;
     this._assertNoPendingPlacements('下单');
@@ -429,7 +431,7 @@ export class PhoenixExchange extends LiveVenueExchange {
       priceUsd: String(price),
       baseUnits: String(size),
     });
-    const remoteClientOrderId = BigInt(order.clientOrderId || Date.now());
+    const remoteClientOrderId = BigInt(requestedClientOrderId);
     if (remoteClientOrderId <= 0n) throw new Error(this.id + ' 下单缺少稳定 clientOrderId');
     const ix = await this.client.ixs.buildPlacePostOnlyOrder({
       authority: this.authority,
@@ -451,7 +453,7 @@ export class PhoenixExchange extends LiveVenueExchange {
       ...order,
       marketId,
       clientOrderId: String(remoteClientOrderId),
-      requestClientOrderId: stableId(order.clientOrderId),
+      requestClientOrderId: requestedClientOrderId,
       price,
       sizeBase: size,
     }, remoteClientOrderId, {

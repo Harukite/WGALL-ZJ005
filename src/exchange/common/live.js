@@ -206,9 +206,11 @@ export class LiveVenueExchange extends EventEmitter {
   _beginPendingPlacement(order, clientOrderId, options = {}) {
     const key = stableId(clientOrderId);
     if (!key) throw new Error(this.venue + ' 下单缺少稳定 clientOrderId');
+    const pendingOrder = { ...order };
+    if (!stableId(pendingOrder.clientOrderId)) pendingOrder.clientOrderId = key;
     const pending = {
       clientOrderId: key,
-      order: { ...order },
+      order: pendingOrder,
       previousIds: new Set(options.previousIds || []),
       metadata: { ...(options.metadata || {}) },
       outcome: null,
@@ -246,8 +248,8 @@ export class LiveVenueExchange extends EventEmitter {
     const actualClientIds = new Set(
       [order?.clientOrderId, order?.requestClientOrderId].map(stableId).filter(Boolean),
     );
-    if (expectedClientIds.size && actualClientIds.size
-      && ![...expectedClientIds].some((clientId) => actualClientIds.has(clientId))) return false;
+    if (!expectedClientIds.size || !actualClientIds.size
+      || ![...expectedClientIds].some((clientId) => actualClientIds.has(clientId))) return false;
     const expectedPrice = Number(expected?.price);
     const requestedPrice = Number(order?.price);
     if (Number.isFinite(expectedPrice) && Number.isFinite(requestedPrice)

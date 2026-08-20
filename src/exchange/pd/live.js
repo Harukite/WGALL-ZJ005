@@ -12,7 +12,7 @@ import {
   toHex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { LiveVenueExchange, num, roundToStep, sleep } from '../common/live.js';
+import { LiveVenueExchange, num, roundToStep, sleep, stableId } from '../common/live.js';
 import { fetchPopdexCandles } from './market-data.js';
 
 const DEFAULT_API = 'https://api.popdex.xyz';
@@ -400,7 +400,7 @@ export class PopdexExchange extends LiveVenueExchange {
     return hash;
   }
 
-  _matchPlacedOrder(openOrders, order, clientOid, previousIds = new Set(), excludedIds = new Set()) {
+  _matchPlacedOrder(openOrders, clientOid, excludedIds = new Set()) {
     const exact = openOrders.find((row) => String(row.clientOid || '') === String(clientOid) && !excludedIds.has(String(row.orderId)));
     return exact || null;
   }
@@ -408,7 +408,7 @@ export class PopdexExchange extends LiveVenueExchange {
   _resolvePendingOrders(openOrders) {
     const claimed = new Set();
     for (const [clientOid, pending] of [...this._pendingOrders]) {
-      const placed = this._matchPlacedOrder(openOrders, pending.order, clientOid, pending.previousIds, claimed);
+      const placed = this._matchPlacedOrder(openOrders, clientOid, claimed);
       if (!placed?.orderId) continue;
       const orderId = String(placed.orderId);
       const resolvedClientOid = isBytes32(placed.clientOid) ? placed.clientOid : clientOid;
@@ -427,10 +427,10 @@ export class PopdexExchange extends LiveVenueExchange {
     }
   }
 
-  async _findPlacedOrder(order, clientOid, previousIds = new Set()) {
+  async _findPlacedOrder(order, clientOid) {
     for (let attempt = 0; attempt < this.orderDiscoveryAttempts; attempt++) {
       const snapshot = await this._refreshMarket(order.marketId);
-      const placed = this._matchPlacedOrder(snapshot.openOrders, order, clientOid, previousIds);
+      const placed = this._matchPlacedOrder(snapshot.openOrders, clientOid);
       if (placed) return placed;
       if (attempt + 1 < this.orderDiscoveryAttempts && this.orderDiscoveryPollMs) await sleep(this.orderDiscoveryPollMs);
     }
@@ -438,6 +438,8 @@ export class PopdexExchange extends LiveVenueExchange {
   }
 
   async placeLimitOrder(order) {
+    const requestClientOrderId = stableId(order.clientOrderId);
+    if (!requestClientOrderId) throw new Error('PopDEX 下单缺少稳定 clientOrderId');
     const price = roundToStep(order.price, this.tickSize);
     const size = this._roundSize(order.sizeBase, price);
     if (!(price > 0) || !(size >= this.minQty)) throw new Error('PopDEX 订单精度或数量不足');
@@ -449,7 +451,7 @@ export class PopdexExchange extends LiveVenueExchange {
       throw new Error('PopDEX PostOnly 订单穿价，等待下一轮行情');
     }
     if (this.orderGapMs) await sleep(this.orderGapMs);
-    const oid = clientOrderId('grid-' + Date.now().toString(36) + '-' + order.clientOrderId);
+    const oid = clientOrderId('grid-' + requestClientOrderId);
     const params = packOrderParams({
       orderType: ORDER_TYPE_LIMIT,
       side: order.side === 'buy' ? SIDE_BUY : SIDE_SELL,
@@ -471,18 +473,16 @@ export class PopdexExchange extends LiveVenueExchange {
         0n,
       ],
     });
-    const previousIds = new Set(before.openOrders.map((row) => String(row.orderId)));
     const pending = {
       clientOid: oid,
       order: { ...order, marketId: 1, price, sizeBase: size },
-      previousIds,
       txHash: null,
       submittedAt: Date.now(),
     };
     this._pendingOrders.set(oid, pending);
     try {
       pending.txHash = await this._send(data, 500_000n, { kind: 'place', clientOid: oid });
-      const placed = await this._findPlacedOrder(pending.order, oid, previousIds);
+      const placed = await this._findPlacedOrder(pending.order, oid);
       if (!placed?.orderId) {
         const error = new Error('PopDEX 交易已确认但 indexer 暂未发现真实订单，停止自动重发');
         error.pending = true;

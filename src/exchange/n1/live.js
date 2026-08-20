@@ -292,6 +292,8 @@ export class N1Exchange extends LiveVenueExchange {
 
   async placeLimitOrder(order) {
     this._ensure();
+    const requestedClientOrderId = stableId(order.clientOrderId);
+    if (!requestedClientOrderId) throw new Error('N1 下单缺少稳定 clientOrderId');
     const resolved = this._takePendingPlacementOutcome(order);
     if (resolved) return resolved;
     this._assertNoPendingPlacements('下单');
@@ -299,11 +301,11 @@ export class N1Exchange extends LiveVenueExchange {
     await this._ensureSession();
     const before = await this._refreshMarket(order.marketId);
     this._applySnapshot(order.marketId, before);
-    const remoteClientOrderId = clientOrderId('grid:' + order.side + ':' + order.levelIndex + ':' + order.clientOrderId);
+    const remoteClientOrderId = clientOrderId('grid:' + order.side + ':' + order.levelIndex + ':' + requestedClientOrderId);
     const pending = this._beginPendingPlacement({
       ...order,
       clientOrderId: String(remoteClientOrderId),
-      requestClientOrderId: stableId(order.clientOrderId),
+      requestClientOrderId: requestedClientOrderId,
     }, remoteClientOrderId);
     try {
       const receipt = await this.user.placeOrder({
