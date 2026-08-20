@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 const html = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+const loginHtml = fs.readFileSync(new URL('../public/login.html', import.meta.url), 'utf8');
 const venues = [
   ['n1', 'N1'],
   ['ph', 'Phoenix'],
@@ -34,5 +35,12 @@ assert.match(html, /makeOverviewCard\(meta\);\s*makeVenuePanel\(meta\);/);
 assert.match(html, /exchangeCtrls\[meta\.key\] = makeExchangeCtrl\(meta\.key, meta\.key \+ '-chart'\)/);
 assert.doesNotMatch(html, /makeCompactVenueCtrl|new-venue-grid|compact-venue/);
 assert.doesNotMatch(html, /ip-new-status/);
+assert.match(html, /\.overview-grid\s*\{[^}]*repeat\(5, minmax\(0, 1fr\)\)/);
+assert.match(html, /class="btn btn-ghost auth-logout"/);
+assert.match(html, /\/api\/auth\/logout/);
+assert.match(html, /X-Auth-Required/);
+assert.match(loginHtml, /jaychougo@gmail\.com/);
+assert.match(loginHtml, /autocomplete="current-password"/);
+assert.match(loginHtml, /\/api\/auth\/login/);
 
 console.log('frontend venue UI parity contract passed');

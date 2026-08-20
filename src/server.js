@@ -27,9 +27,18 @@ import { setupProxies, checkProxy } from './proxy.js';
 import { loadSnapshot, saveSnapshot } from './persist.js';
 import { createAiService } from './ai/service.js';
 import { dashboardExchangeState } from './overview.js';
+import { createAuth } from './auth.js';
 
 // ── 启动配置 ─────────────────────────────────────────────────────────────────
 const cfg = getConfig();
+const auth = createAuth(cfg.auth);
+if (!auth.configured) {
+  console.warn('[登录] AUTH_PASSWORD_HASH 尚未配置；登录页将拒绝登录。');
+  if (auth.requireHttps) {
+    console.error('[登录] 非回环部署未配置有效密码哈希，已拒绝启动。');
+    process.exit(1);
+  }
+}
 
 // ── 代理设置 ─────────────────────────────────────────────────────────────────
 const proxyResult = await setupProxies(cfg);
@@ -131,15 +140,30 @@ const MIME = {
 };
 const PUBLIC_ROOT = path.join(ROOT, 'public');
 
-function send(res, code, obj) {
+function send(res, code, obj, headers = {}) {
   const body = JSON.stringify(obj, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
   if (res.headersSent) { try { res.end(); } catch { /* ignore */ } return; }
   res.writeHead(code, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    ...headers,
   });
   res.end(body);
+}
+
+function redirect(res, location) {
+  if (res.headersSent) { try { res.end(); } catch { /* ignore */ } return; }
+  res.writeHead(302, {
+    Location: location,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+  });
+  res.end();
 }
 
 function readBody(req, maxBytes = 1_000_000) {
@@ -294,6 +318,37 @@ const server = http.createServer(async (request, res) => {
   const p = url.pathname;
 
   try {
+    // ── 单账户登录与访问控制 ─────────────────────────────────────────────
+    if (p === '/api/auth/status') {
+      return send(res, 200, auth.status(request));
+    }
+    if (p === '/api/auth/login' && request.method === 'POST') {
+      const result = auth.login(request, await readBody(request));
+      return send(res, result.status, result.body, result.headers);
+    }
+    if (p === '/api/auth/logout' && request.method === 'POST') {
+      const result = auth.logout(request);
+      return send(res, result.status, result.body, result.headers);
+    }
+    if (p === '/login' || p === '/login.html') {
+      if (auth.isAuthenticated(request)) return redirect(res, '/');
+      const loginFile = path.join(PUBLIC_ROOT, 'login.html');
+      res.writeHead(200, {
+        'Content-Type': MIME['.html'],
+        'Cache-Control': 'no-store',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
+        'Referrer-Policy': 'no-referrer',
+      });
+      return fs.createReadStream(loginFile).pipe(res);
+    }
+    if (!auth.isAuthenticated(request)) {
+      if (p.startsWith('/api/')) {
+        return send(res, 401, { error: '未登录，请先登录。', code: 'AUTH_REQUIRED' }, { 'X-Auth-Required': '1' });
+      }
+      return redirect(res, '/login');
+    }
+
     // ── 总览 API ──────────────────────────────────────────────────────────
     if (p === '/api/overview') {
       return send(res, 200, {
@@ -479,7 +534,9 @@ const server = http.createServer(async (request, res) => {
     if (insidePublic && fs.existsSync(full) && fs.statSync(full).isFile()) {
       res.writeHead(200, {
         'Content-Type': MIME[path.extname(full)] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
         'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'DENY',
         'Referrer-Policy': 'no-referrer',
       });
       return fs.createReadStream(full).pipe(res);

@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DEFAULT_AUTH_EMAIL } from './auth.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -29,6 +30,16 @@ export function loadEnv() {
 
 export function getConfig() {
   loadEnv();
+
+  const host = process.env.HOST || '127.0.0.1';
+  const isLoopbackHost = ['127.0.0.1', 'localhost', '::1'].includes(host);
+  const requireHttpsValue = String(process.env.AUTH_REQUIRE_HTTPS || 'auto').trim().toLowerCase();
+  const requireHttps = requireHttpsValue === 'auto'
+    ? !isLoopbackHost
+    : ['1', 'true', 'yes', 'on'].includes(requireHttpsValue);
+  const trustProxy = ['1', 'true', 'yes', 'on'].includes(
+    String(process.env.AUTH_TRUST_PROXY || '').trim().toLowerCase(),
+  );
 
   // 全局代理：作为所有交易所的默认代理
   const globalProxy =
@@ -213,10 +224,15 @@ export function getConfig() {
 
   return {
     port: Number(process.env.PORT || 8283),
-    // SECURITY: bind to loopback by default so the dashboard (which can start/stop
-    // LIVE trading and edit .env) is NOT exposed to the local network. Set
-    // HOST=0.0.0.0 explicitly only if you understand the risk and add your own auth.
-    host: process.env.HOST || '127.0.0.1',
+    // SECURITY: bind to loopback by default. Non-loopback deployments must use
+    // HTTPS for the single-account dashboard login.
+    host,
+    auth: {
+      email: process.env.AUTH_EMAIL || DEFAULT_AUTH_EMAIL,
+      passwordHash: process.env.AUTH_PASSWORD_HASH || '',
+      requireHttps,
+      trustProxy,
+    },
     globalProxy,
     de,
     ex,

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DEFAULT_AUTH_EMAIL, isPasswordHash } from '../src/auth.js';
 import { loadEnv } from '../src/config.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -53,8 +54,29 @@ const balance = Number(value('PAPER_BALANCE') || 10000);
 if (!Number.isFinite(balance) || balance <= 0) errors.push('PAPER_BALANCE 必须是大于 0 的数字。');
 
 const host = value('HOST') || '127.0.0.1';
-if (!['127.0.0.1', 'localhost', '::1'].includes(host)) {
-  warnings.push(`HOST=${host} 不是纯本机监听地址；仪表盘没有登录鉴权，请勿直接暴露到公网。`);
+const isLoopbackHost = ['127.0.0.1', 'localhost', '::1'].includes(host);
+const authEmail = value('AUTH_EMAIL') || DEFAULT_AUTH_EMAIL;
+const authHash = value('AUTH_PASSWORD_HASH');
+const authHttps = value('AUTH_REQUIRE_HTTPS') || 'auto';
+const trustProxy = ['1', 'true', 'yes', 'on'].includes(value('AUTH_TRUST_PROXY').toLowerCase());
+if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail)) {
+  errors.push('AUTH_EMAIL 必须是有效邮箱地址。');
+}
+if (!authHash) {
+  const message = 'AUTH_PASSWORD_HASH 未配置；请运行 npm run auth:hash 生成哈希后写入 .env。';
+  if (isLoopbackHost) warnings.push(message);
+  else errors.push(message);
+} else if (!isPasswordHash(authHash)) {
+  errors.push('AUTH_PASSWORD_HASH 格式无效；必须填写 npm run auth:hash 输出的 scrypt 哈希，不能填写明文密码。');
+}
+if (!['auto', '0', '1', 'true', 'false', 'yes', 'no', 'on', 'off'].includes(authHttps.toLowerCase())) {
+  errors.push('AUTH_REQUIRE_HTTPS 只能是 auto、0/1、true/false、yes/no 或 on/off。');
+}
+if (!isLoopbackHost && ['0', 'false', 'no', 'off'].includes(authHttps.toLowerCase())) {
+  errors.push(`HOST=${host} 时禁止关闭 AUTH_REQUIRE_HTTPS；公网登录必须通过 HTTPS。`);
+}
+if (!isLoopbackHost && !trustProxy) {
+  warnings.push('HOST 非回环地址；若 HTTPS 由 Dokploy/Traefik 反向代理终止，请设置 AUTH_TRUST_PROXY=1。');
 }
 
 const modes = {
