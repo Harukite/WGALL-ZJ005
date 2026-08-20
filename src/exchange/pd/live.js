@@ -277,12 +277,14 @@ export class PopdexExchange extends LiveVenueExchange {
     let position = 0;
     let unrealizedPnl = 0;
     let entryPrice = 0;
+    let liquidationPrice = 0;
     for (const row of positions || []) {
       if (String(row.symbol || '').toUpperCase() !== this.symbol.toUpperCase()) continue;
       const size = num(row.holdQty ?? row.size ?? row.holdSize ?? row.qty ?? row.positionSize);
       const side = String(row.side || row.positionSide || '').toLowerCase();
       position += side.includes('short') || side === 'sell' ? -Math.abs(size) : row.size != null && Number(row.size) < 0 ? Number(row.size) : Math.abs(size);
       entryPrice = num(row.avgPrice ?? row.entryPrice ?? row.avgEntryPrice);
+      liquidationPrice = num(row.liquidationPrice ?? row.liquidation_price ?? row.liqPrice ?? row.liq_price);
       const upl = num(row.unPnl ?? row.unrealizedPnl ?? row.upl ?? row.unrealizedProfit, NaN);
       if (Number.isFinite(upl)) unrealizedPnl += upl;
     }
@@ -319,7 +321,10 @@ export class PopdexExchange extends LiveVenueExchange {
       price: mid,
       balance: Number.isFinite(equity) && equity > 0 ? equity : undefined,
       equity: Number.isFinite(equity) && equity > 0 ? equity : undefined,
-      position: position ? { sizeBase: position, entryPrice, unrealizedPnl } : null,
+      position: position ? {
+        sizeBase: position, entryPrice, unrealizedPnl,
+        ...(liquidationPrice > 0 ? { liquidationPrice } : {}),
+      } : null,
       openOrders: openOrders.filter((row) => row.orderId),
     };
   }

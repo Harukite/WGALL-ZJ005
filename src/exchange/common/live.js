@@ -386,10 +386,7 @@ export class LiveVenueExchange extends EventEmitter {
     const positionDelta = hasPosition && previousPosition != null ? currentPosition - previousPosition : 0;
     if (hasPosition) this._positionSnapshots.set(id, currentPosition);
     const currentPrice = Number(snapshot.price);
-    if (currentPrice > 0) {
-      this.prices.set(id, currentPrice);
-      this.emit('price', { marketId: id, price: currentPrice });
-    }
+    if (currentPrice > 0) this.prices.set(id, currentPrice);
     if (snapshot.balance != null && Number.isFinite(Number(snapshot.balance))) this.balance = Number(snapshot.balance);
     if (snapshot.equity != null && Number.isFinite(Number(snapshot.equity))) this.equity = Number(snapshot.equity);
     if (snapshot.realizedPnl != null && Number.isFinite(Number(snapshot.realizedPnl))) this.realizedPnl = Number(snapshot.realizedPnl);
@@ -400,6 +397,10 @@ export class LiveVenueExchange extends EventEmitter {
       if (Number(position.sizeBase)) this.positions.set(id, { ...position, sizeBase: Number(position.sizeBase) });
       else this.positions.delete(id);
     }
+    // Publish the price only after the same authoritative snapshot has
+    // refreshed equity and position data. GridBot risk checks must not read
+    // the previous account state for the current mark price.
+    if (currentPrice > 0) this.emit('price', { marketId: id, price: currentPrice });
     const open = snapshot.openOrders;
     const openById = new Map(open.map((order) => [stableId(order.orderId ?? order.id), order]));
     const now = Date.now();

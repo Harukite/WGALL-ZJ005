@@ -236,6 +236,10 @@ export class VenuePaperExchange extends EventEmitter {
 
   _matchFills(marketId, _previous, current) {
     for (const order of [...this.getOpenOrders(marketId)]) {
+      // The price/fill callback may cancel another order while this snapshot
+      // is being processed (risk gate, stop, or user action). Re-check the
+      // authoritative local book before simulating that later fill.
+      if (!this.orders.has(order.orderId)) continue;
       const crossed = order.side === 'buy' ? current <= Number(order.price) : current >= Number(order.price);
       if (!crossed) continue;
       if (order.reduceOnly && !this._reduces(marketId, order.side)) {

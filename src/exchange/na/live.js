@@ -166,11 +166,13 @@ export class NadoExchange extends LiveVenueExchange {
     }
     let position = 0;
     let unrealizedPnl = 0;
+    let liquidationPrice = 0;
     let quoteBalance = 0;
     for (const balance of summary?.balances || []) {
       if (isSpotBalance(balance) && balance.productId === 0) quoteBalance += humanAmount(balance.amount);
       if (isPerpBalance(balance) && balance.productId === this.productId) {
         position = humanAmount(balance.amount);
+        liquidationPrice = humanAmount(balance.liquidationPrice ?? balance.liquidation_price ?? balance.liqPrice ?? balance.liq_price);
         try { unrealizedPnl = humanAmount(calcPerpBalanceValue(balance)); } catch { /* optional */ }
       }
     }
@@ -197,7 +199,10 @@ export class NadoExchange extends LiveVenueExchange {
       price: mid,
       balance: equity > 0 ? equity : undefined,
       equity: equity > 0 ? equity : undefined,
-      position: position ? { sizeBase: position, entryPrice: 0, unrealizedPnl } : null,
+      position: position ? {
+        sizeBase: position, entryPrice: 0, unrealizedPnl,
+        ...(liquidationPrice > 0 ? { liquidationPrice } : {}),
+      } : null,
       openOrders,
     };
   }

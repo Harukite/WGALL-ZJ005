@@ -769,6 +769,7 @@ th { color: var(--mut2); font-weight: 600; font-size: 10px; text-transform: uppe
       <div class="operation-issue" id="de-action-issue" style="display:none"></div>
       <div class="kv"><span class="lbl">总盈亏 / 收益率</span><span class="val" id="de-st-total">—</span></div>
       <div class="kv"><span class="lbl">挂单数 / 完成格</span><span class="val" id="de-st-orders">—</span></div>
+      <div class="kv"><span class="lbl">风险闸门</span><span class="val" id="de-st-risk">—</span></div>
       <button class="btn btn-ghost" id="de-reset-btn" style="margin-top:8px;font-size:12px">重置统计（盈亏/成交量清零）</button>
       <button class="btn btn-ghost" id="de-reconnect-btn" style="margin-top:8px;font-size:12px">🔌 重连交易所（不动挂单/持仓）</button>
     </div>
@@ -895,6 +896,7 @@ th { color: var(--mut2); font-weight: 600; font-size: 10px; text-transform: uppe
       </div>
       <div class="kv"><span class="lbl">总盈亏 / 收益率</span><span class="val" id="ex-st-total">—</span></div>
       <div class="kv"><span class="lbl">挂单数 / 完成格</span><span class="val" id="ex-st-orders">—</span></div>
+      <div class="kv"><span class="lbl">风险闸门</span><span class="val" id="ex-st-risk">—</span></div>
       <button class="btn btn-ghost" id="ex-reset-btn" style="margin-top:8px;font-size:12px">重置统计（盈亏/成交量清零）</button>
       <button class="btn btn-ghost" id="ex-reconnect-btn" style="margin-top:8px;font-size:12px">🔌 重连交易所（不动挂单/持仓）</button>
     </div>
@@ -1021,6 +1023,7 @@ th { color: var(--mut2); font-weight: 600; font-size: 10px; text-transform: uppe
       </div>
       <div class="kv"><span class="lbl">总盈亏 / 收益率</span><span class="val" id="rs-st-total">—</span></div>
       <div class="kv"><span class="lbl">挂单数 / 完成格</span><span class="val" id="rs-st-orders">—</span></div>
+      <div class="kv"><span class="lbl">风险闸门</span><span class="val" id="rs-st-risk">—</span></div>
       <button class="btn btn-ghost" id="rs-reset-btn" style="margin-top:8px;font-size:12px">重置统计（盈亏/成交量清零）</button>
       <button class="btn btn-ghost" id="rs-reconnect-btn" style="margin-top:8px;font-size:12px">🔌 重连交易所（不动挂单/持仓）</button>
     </div>
@@ -1147,6 +1150,7 @@ th { color: var(--mut2); font-weight: 600; font-size: 10px; text-transform: uppe
       </div>
       <div class="kv"><span class="lbl">总盈亏 / 收益率</span><span class="val" id="ar-st-total">—</span></div>
       <div class="kv"><span class="lbl">挂单数 / 完成格</span><span class="val" id="ar-st-orders">—</span></div>
+      <div class="kv"><span class="lbl">风险闸门</span><span class="val" id="ar-st-risk">—</span></div>
       <button class="btn btn-ghost" id="ar-reset-btn" style="margin-top:8px;font-size:12px">重置统计（盈亏/成交量清零）</button>
       <button class="btn btn-ghost" id="ar-reconnect-btn" style="margin-top:8px;font-size:12px">🔌 重连交易所（不动挂单/持仓）</button>
     </div>
@@ -1230,7 +1234,7 @@ th { color: var(--mut2); font-weight: 600; font-size: 10px; text-transform: uppe
         <div><div class="kv"><span class="lbl">运行状态</span><span class="val" id="lr-st-run">未运行</span></div><div class="kv"><span class="lbl">最新价</span><span class="val" id="lr-st-price">—</span></div><div class="kv"><span class="lbl">账户余额</span><span class="val" id="lr-st-bal">—</span></div><div class="kv"><span class="lbl">权益</span><span class="val" id="lr-st-eq">—</span></div></div>
         <div><div class="kv"><span class="lbl">持仓</span><span class="val" id="lr-st-pos">—</span></div><div class="kv"><span class="lbl">持仓均价</span><span class="val" id="lr-st-entry">—</span></div><div class="kv"><span class="lbl">强平价格</span><span class="val" id="lr-st-liq">—</span></div><div class="kv"><span class="lbl">已实现盈亏</span><span class="val" id="lr-st-rpnl">—</span></div><div class="kv"><span class="lbl">未实现盈亏</span><span class="val" id="lr-st-upnl">—</span></div></div>
       </div>
-      <div class="kv"><span class="lbl">总盈亏 / 收益率</span><span class="val" id="lr-st-total">—</span></div><div class="kv"><span class="lbl">挂单数 / 完成格</span><span class="val" id="lr-st-orders">—</span></div>
+      <div class="kv"><span class="lbl">总盈亏 / 收益率</span><span class="val" id="lr-st-total">—</span></div><div class="kv"><span class="lbl">挂单数 / 完成格</span><span class="val" id="lr-st-orders">—</span></div><div class="kv"><span class="lbl">风险闸门</span><span class="val" id="lr-st-risk">—</span></div>
       <button class="btn btn-ghost" id="lr-reset-btn" style="margin-top:8px;font-size:12px">重置统计（盈亏/成交量清零）</button><button class="btn btn-ghost" id="lr-reconnect-btn" style="margin-top:8px;font-size:12px">🔌 重连交易所（不动挂单/持仓）</button>
     </div>
     <div class="panel" style="margin-bottom:14px"><div class="panel-title">价格 / 网格</div><div id="lr-range-warn"></div><div class="chartbox"><canvas id="lr-chart"></canvas></div></div>
@@ -1553,6 +1557,18 @@ function placementProgressText(state) {
   const p = state?.placementProgress;
   if (!p) return '';
   return `挂单目标 ${p.target} / 已确认 ${p.confirmed} / 待重试 ${p.pending}${p.failed ? ` / 已停止重试 ${p.failed}` : ''}`;
+}
+
+function riskGuardText(risk) {
+  if (!risk) return '未启用';
+  const labels = { normal: '正常', soft: '软保护', emergency: '紧急保护' };
+  const reasons = {
+    'shock-move': '短时冲击', 'one-sided-move': '单边行情', 'max-position': '持仓上限',
+    'liquidation-distance': '强平距离', drawdown: '账户回撤', stabilizing: '稳定观察中',
+  };
+  const side = risk.blockedSide === 'buy' ? '暂停买入开仓' : risk.blockedSide === 'sell' ? '暂停卖出开仓' : risk.blockedSide === 'both' ? '暂停双向开仓' : '';
+  const detail = risk.reason && risk.reason !== 'normal' ? ` · ${reasons[risk.reason] || risk.reason}` : '';
+  return `${labels[risk.level] || risk.level || '未知'}${detail}${side ? `（${side}）` : ''}`;
 }
 
 function issueHtml(issue, fallbackAddress) {
@@ -2016,6 +2032,11 @@ function makeExchangeCtrl(prefix, chartId) {
     P('st-total').innerHTML = `${pnlHtml(s.totalPnl)} <span class="muted">/ ${s.returnPct != null ? `<span class="${cls(s.returnPct)}">${s.returnPct>=0?'+':''}${s.returnPct}%</span>` : '—'}</span>`;
     const progressText = placementProgressText(s);
     P('st-orders').textContent = `${s.openOrders ?? 0} 单 / ${s.stats?.completedRungs ?? 0} 格${progressText ? ` · ${progressText}` : ''}`;
+    if (P('st-risk')) {
+      const risk = s.riskGuard;
+      const riskClass = risk?.level === 'emergency' ? 'badge-stop' : risk?.level === 'soft' ? 'badge' : 'badge-run';
+      P('st-risk').innerHTML = risk ? `<span class="badge ${riskClass}">${escapeHtml(riskGuardText(risk))}</span>` : '—';
+    }
 
     const progress = s.placementProgress;
     if (!busy && run && progress) {
@@ -2203,6 +2224,7 @@ const NEW_VENUES = [
        <div class="operation-issue" id="${p}-action-issue" style="display:none"></div>
        <div class="kv"><span class="lbl">总盈亏 / 收益率</span><span class="val" id="${p}-st-total">—</span></div>
        <div class="kv"><span class="lbl">挂单数 / 完成格</span><span class="val" id="${p}-st-orders">—</span></div>
+       <div class="kv"><span class="lbl">风险闸门</span><span class="val" id="${p}-st-risk">—</span></div>
        <button class="btn btn-ghost" id="${p}-reset-btn" style="margin-top:8px;font-size:12px">重置统计（盈亏/成交量清零）</button>
        <button class="btn btn-ghost" id="${p}-reconnect-btn" style="margin-top:8px;font-size:12px">🔌 重连交易所（不动挂单/持仓）</button>
      </div>

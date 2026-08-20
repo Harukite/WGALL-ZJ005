@@ -220,6 +220,7 @@ export class PaperExchange extends EventEmitter {
   _matchFills(marketId, prev, cur) {
     for (const o of [...this.orders.values()]) {
       if (o.marketId !== marketId) continue;
+      if (!this.orders.has(o.orderId)) continue;
       const crossedBuy = o.side === 'buy' && cur <= o.price;
       const crossedSell = o.side === 'sell' && cur >= o.price;
       if (!crossedBuy && !crossedSell) continue;

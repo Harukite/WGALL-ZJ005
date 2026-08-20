@@ -286,10 +286,12 @@ export class PhoenixExchange extends LiveVenueExchange {
     let position = 0;
     let entryPrice = 0;
     let unrealizedPnl = 0;
+    let liquidationPrice = 0;
     for (const row of subaccount.positions || []) {
       if (String(row.symbol || '').toUpperCase() !== String(symbol).toUpperCase()) continue;
       position = num(row.basePositionLots) * precision.lotSize;
       entryPrice = num(row.entryPriceUsd ?? ticksToPrice(row.entryPriceTicks, precision));
+      liquidationPrice = num(row.liquidationPrice ?? row.liquidation_price ?? row.liqPrice ?? row.liq_price);
       if (entryPrice > 0) unrealizedPnl = position * (price - entryPrice);
       break;
     }
@@ -320,7 +322,10 @@ export class PhoenixExchange extends LiveVenueExchange {
       price,
       balance: collateral > 0 ? collateral : undefined,
       equity: collateral > 0 ? collateral : undefined,
-      position: position ? { sizeBase: position, entryPrice, unrealizedPnl } : null,
+      position: position ? {
+        sizeBase: position, entryPrice, unrealizedPnl,
+        ...(liquidationPrice > 0 ? { liquidationPrice } : {}),
+      } : null,
       openOrders,
     };
     await this._reconcilePendingPlacementFills(marketId);

@@ -574,6 +574,7 @@ function pick(s, mode) {
     openOrders: s.openOrders ?? 0,
     exchangeOpenOrders: s.exchangeOpenOrders ?? null,
     outOfRange: s.outOfRange ?? false,
+    riskGuard: s.riskGuard ?? null,
     health: s.health ?? null,
     lastPrice: s.lastPrice,
     config: s.config,

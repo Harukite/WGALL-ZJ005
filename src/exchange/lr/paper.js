@@ -88,6 +88,7 @@ export class PaperExchange extends EventEmitter {
       const next = this.dataSource === 'real' ? old : Math.max(1e-8, old * (1 + (Math.random() * 2 - 1) * 0.0015));
       this.prices.set(id, next); this.emit('price', { marketId: id, price: next });
       for (const order of this.getOpenOrders(id)) {
+        if (!this.orders.has(order.orderId)) continue;
         if (!(order.side === 'buy' ? next <= order.price : next >= order.price)) continue;
         if (order.reduceOnly && !this._reduces(id, order.side)) { this.orders.delete(order.orderId); continue; }
         this.orders.delete(order.orderId); this._fill(id, order.side, Number(order.price), Number(order.sizeBase));

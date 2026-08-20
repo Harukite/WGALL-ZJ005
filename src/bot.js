@@ -5,6 +5,7 @@
 // alerts (optional auto-stop), periodic open-order reconciliation, crash-safe
 // persistence with resume-on-restart, live range adjustment, and a health probe.
 import { buildGrid, seedOrders, replacementFor, isReduceOnly } from './grid.js';
+import { RiskGuard } from './risk.js';
 
 const RECONCILE_MS = 30000;   // periodic open-order reconciliation cadence
 const PRUNE_GRACE_MS = 20000; // don't prune a tracked order younger than this
@@ -23,6 +24,13 @@ export class GridBot {
     this.lastPrice = null;
     this.outOfRange = false;
     this.risk = null;
+    this.riskGuard = null;           // outer protection layer; never changes grid math
+    this._riskDecision = null;
+    this._riskCancelQueue = new Set();
+    this._riskCancelInFlight = false;
+    this._riskRunToken = 0;
+    this._riskStopPromise = null;
+    this._lastRiskAlertKey = null;
     this._stopping = false;         // re-entrancy guard for auto-stop
     this._coidSeq = 0;              // monotonic client-order-id counter
     this._placeFails = 0;          // cumulative order-placement failures
@@ -87,12 +95,166 @@ export class GridBot {
   /** Notify the persistence layer (if any) that durable state changed. */
   _changed() { try { this._onChange?.(this.snapshot()); } catch { /* never let persistence break trading */ } }
 
+  _initRiskGuard(snapshot = null) {
+    if (!this.config || this.recovery || !this.grid) {
+      this.riskGuard = null;
+      this._riskDecision = null;
+      return;
+    }
+    this.riskGuard = new RiskGuard(this.config.riskGuard, {
+      gridCount: this.config.gridCount,
+      sizeBase: this.config.sizeBase,
+    });
+    if (snapshot) this.riskGuard.restore(snapshot);
+    this.config.riskGuard = this.riskGuard.config;
+    this._riskDecision = this.riskGuard.evaluate(this._riskContext());
+  }
+
+  _riskContext(timestamp = Date.now()) {
+    const marketId = this.config?.marketId;
+    const position = marketId == null ? null : this.ex.getPosition?.(marketId);
+    const equity = typeof this.ex.equity === 'number' ? this.ex.equity
+      : typeof this.ex.balance === 'number' ? this.ex.balance : null;
+    return {
+      price: this.lastPrice,
+      timestamp,
+      position,
+      equity,
+      startBalance: this.startBalance,
+    };
+  }
+
+  _observeRisk(price, timestamp = Date.now()) {
+    if (!this.riskGuard) return null;
+    const decision = this.riskGuard.observe({ ...this._riskContext(timestamp), price, timestamp });
+    this._riskDecision = decision;
+    if (this.running) this._handleRiskDecision(decision);
+    return decision;
+  }
+
+  _evaluateRisk(timestamp = Date.now()) {
+    if (!this.riskGuard) return null;
+    const decision = this.riskGuard.evaluate(this._riskContext(timestamp));
+    this._riskDecision = decision;
+    if (this.running) this._handleRiskDecision(decision);
+    return decision;
+  }
+
+  _riskAllowsOrder(o, opening, reduceOnly, sizeBase, positionSizeOverride = null) {
+    if (!this.riskGuard || !opening || reduceOnly || o.recovery) return true;
+    const decision = this._evaluateRisk();
+    const position = this.ex.getPosition?.(this.config.marketId);
+    const result = this.riskGuard.canPlace({
+      side: o.side, opening, reduceOnly, recovery: !!o.recovery,
+      sizeBase, positionSize: positionSizeOverride ?? position?.sizeBase ?? 0,
+    });
+    if (!result.allowed && decision?.level === 'emergency') this._triggerRiskEmergency(decision);
+    return result.allowed;
+  }
+
+  _handleRiskDecision(decision) {
+    if (!decision || !this.running || !this.config) return;
+    const key = `${decision.level}:${decision.reason}:${decision.blockedSide || ''}`;
+    const previousKey = this._lastRiskAlertKey;
+    if (key !== previousKey) {
+      this._lastRiskAlertKey = key;
+      if (decision.level === 'emergency') {
+        this._alert(`🚨 风险闸门触发（${riskReasonText(decision.reason)}）：已暂停所有新开仓，执行撤单 + 平仓 + 停止。`);
+      } else if (decision.level === 'soft') {
+        const side = decision.blockedSide === 'buy' ? '买入' : decision.blockedSide === 'sell' ? '卖出' : '双向';
+        this._alert(`⚠️ 风险闸门进入软保护（${riskReasonText(decision.reason)}）：暂停${side}开仓；平仓/只减仓订单继续允许。`);
+      } else if (decision.level === 'normal' && previousKey) {
+        this._alert('✅ 风险闸门已解除：行情已稳定，后续安全开仓允许；已撤销的逆势开仓单不会自动重铺，请确认后手动补格。');
+      }
+    }
+    if (decision.level === 'emergency') {
+      this._triggerRiskEmergency(decision);
+    } else if (decision.level === 'soft') {
+      for (const [orderId, info] of this.active) {
+        if (!this._isRiskOpening(info) || !decision.blockedSides.includes(info.side)) continue;
+        this._riskCancelQueue.add(orderId);
+      }
+      this._drainRiskCancelQueue().catch(() => {});
+    }
+    this._changed();
+  }
+
+  _isRiskOpening(info) {
+    return info?.opening !== false && !info?.reduceOnly && !info?.recovery;
+  }
+
+  async _drainRiskCancelQueue() {
+    if (this._riskCancelInFlight || !this._riskCancelQueue.size || !this.running || !this.config) return;
+    this._riskCancelInFlight = true;
+    const ids = [...this._riskCancelQueue];
+    this._riskCancelQueue.clear();
+    const token = this._riskRunToken;
+    const marketId = this.config.marketId;
+    try {
+      const requestErrors = [];
+      for (const id of ids) {
+        if (!this.active.has(id)) continue;
+        try {
+          const accepted = await this.ex.cancelOrder?.(marketId, id);
+          if (accepted === false) requestErrors.push(`${id}: 交易所未接受撤单请求`);
+        } catch (e) {
+          requestErrors.push(`${id}: ${e?.message || e}`);
+        }
+      }
+      if (requestErrors.length) throw new Error(requestErrors.join('；'));
+      await this._confirmOrdersGone(marketId, ids);
+      if (token !== this._riskRunToken || !this.running || this.config.marketId !== marketId) return;
+      for (const id of ids) {
+        this.active.delete(id);
+        try { this.ex.forgetOrder?.(id); } catch { /* exchange state is authoritative */ }
+      }
+      this._alert(`软保护已确认撤销 ${ids.length} 个逆势开仓挂单。`);
+      this._changed();
+    } catch (e) {
+      this._alert(`❌ 软保护撤销逆势开仓单未完成确认：${e?.message || e}；继续阻断新开仓并等待下次对账。`);
+      this._changed();
+    } finally {
+      const shouldDrain = this._riskCancelQueue.size > 0 && this.running;
+      this._riskCancelInFlight = false;
+      if (shouldDrain) this._drainRiskCancelQueue().catch(() => {});
+    }
+  }
+
+  _invalidateRiskOperations() {
+    this._riskRunToken++;
+    this._riskCancelQueue.clear();
+  }
+
+  _triggerRiskEmergency() {
+    if (this._riskStopPromise || !this.running || !this.config) return;
+    this._riskCancelQueue.clear();
+    this._riskStopPromise = (async () => {
+      // Preempt the local paper snapshot before _matchFills runs. Live
+      // exchanges still require the existing authoritative cancel confirmation
+      // inside stop(), so this is only a first fail-closed request.
+      this._pauseTradingRuntime();
+      try {
+        const accepted = await this.ex.cancelAll?.(this.config.marketId);
+        if (accepted === false) this._alert('⚠️ 风险闸门预撤单未被交易所接受，继续进入停止流程并等待权威确认。');
+      } catch (e) {
+        this._alert(`⚠️ 风险闸门预撤单请求异常：${e?.message || e}，继续进入停止流程。`);
+      }
+      try {
+        await this.stop({ closePosition: true });
+      } catch (e) {
+        this._alert(`❌ 风险闸门停止流程未完成：${e?.message || e}；请立即人工核对挂单和持仓。`);
+      }
+    })().finally(() => { this._riskStopPromise = null; });
+    this._riskStopPromise.catch(() => {});
+  }
+
   /** Durable snapshot for crash recovery / resume. Includes resting orders. */
   snapshot() {
     return {
       running: this.running, config: this.config, stats: this.stats,
       recovery: this.recovery, pnlBase: this._pnlBase,
       startBalance: this.startBalance, outOfRange: this.outOfRange, lastPrice: this.lastPrice,
+      riskGuard: this.riskGuard?.snapshot() ?? null,
       active: [...this.active.entries()],
       placementProgress: this._placementProgress,
       retryQueue: this._retryQueue,
@@ -109,11 +271,14 @@ export class GridBot {
     this.stats = { buys: 0, sells: 0, completedRungs: 0, gridProfit: 0, volume: 0, ...(snap.stats || {}) };
     this.startBalance = snap.startBalance ?? null;
     this._pnlBase = snap.pnlBase ?? null;
+    this.lastPrice = snap.lastPrice ?? null;
+    this.outOfRange = !!snap.outOfRange;
     this._placementProgress = snap.placementProgress ?? null;
     this._retryQueue = Array.isArray(snap.retryQueue) ? snap.retryQueue : [];
     try {
       this.grid = buildGrid({ lower: this.config.lower, upper: this.config.upper, gridCount: this.config.gridCount });
       this._recomputeRisk();
+      this._initRiskGuard(snap.riskGuard);
     } catch { /* config may be incomplete */ }
   }
 
@@ -125,6 +290,7 @@ export class GridBot {
   async resume(snap) {
     if (!snap || !snap.config) throw new Error('无可恢复的运行中网格快照');
     if (this.running) throw new Error('已在运行，无法重复恢复');
+    this._invalidateRiskOperations();
     // Standalone recovery ladder has no grid (gridCount=null): resume it via its
     // own path — the old code fell into buildGrid, threw, and the fallback then
     // CANCELLED the whole ladder while the position stayed open.
@@ -142,6 +308,7 @@ export class GridBot {
     this.lastPrice = snap.lastPrice ?? null;
     this.grid = buildGrid({ lower: this.config.lower, upper: this.config.upper, gridCount: this.config.gridCount });
     this._recomputeRisk();
+    this._initRiskGuard(snap.riskGuard);
 
     // Rebuild our active map AND the adapter's order tracking so fills on these
     // pre-existing orders are detected.
@@ -167,16 +334,21 @@ export class GridBot {
     this._alert(`已恢复运行中的 ${this.config.displayName} ${labelMode(this.config.mode)}：接管 ${this.active.size} 个挂单，正在与交易所对账…`);
     this.reconcileOpenOrders().catch(() => {}); // immediate reconcile
     this._changed();
+    if (this._riskDecision?.level && this._riskDecision.level !== 'normal') {
+      this._handleRiskDecision(this._riskDecision);
+    }
     return this.getState();
   }
 
   /** Resume a standalone reduce-only recovery ladder after a process restart. */
   async _resumeRecovery(snap) {
+    this._invalidateRiskOperations();
     this.config = snap.config;
     this.stats = { buys: 0, sells: 0, completedRungs: 0, gridProfit: 0, volume: 0, ...(snap.stats || {}) };
     this.startBalance = snap.startBalance ?? null;
     this._pnlBase = snap.pnlBase ?? null;
     this.grid = null; this.risk = null;
+    this.riskGuard = null; this._riskDecision = null;
     this.recovery = true; this.outOfRange = false;
     this.lastPrice = snap.lastPrice ?? null;
     this._noPosStreak = 0;
@@ -215,6 +387,7 @@ export class GridBot {
    */
   async recoverStrayOrders() {
     if (!this.config) return;
+    this._invalidateRiskOperations();
     await this._cancelAllConfirmed(this.config.marketId, '恢复失败后清理遗留挂单');
     this._alert('⚠️ 检测到上次运行未正常结束：已撤销该市场遗留挂单。请确认仓位后重新启动网格。');
     this._changed();
@@ -329,7 +502,7 @@ export class GridBot {
     return true;
   }
 
-  /** @param cfg {marketId, mode, lower, upper, gridCount, sizeBase, leverage, outOfRangeAction} */
+  /** @param cfg {marketId, mode, lower, upper, gridCount, sizeBase, leverage, outOfRangeAction, riskGuard} */
   async start(cfg) {
     if (this.running || this._starting) throw new Error('机器人已在运行或正在启动，请勿重复点击。');
     this._starting = true;
@@ -340,6 +513,7 @@ export class GridBot {
   async _start(cfg) {
     const market = (await this.ex.getMarkets()).find((m) => m.marketId === Number(cfg.marketId));
     if (!market) throw new Error('找不到该市场 marketId=' + cfg.marketId);
+    this._invalidateRiskOperations();
 
     const leverage = Math.min(Number(cfg.leverage || 3), market.maxLeverage || 50);
     const sizeBase = Math.max(Number(cfg.sizeBase), market.minOrderSize || 0);
@@ -350,13 +524,17 @@ export class GridBot {
       gridCount: Number(cfg.gridCount), sizeBase, leverage,
       // 区间外止损策略：'close'=冲破区间平仓（撤单+平仓+停止）；'recover'=只减仓回收阶梯
       outOfRangeAction: cfg.outOfRangeAction === 'recover' ? 'recover' : 'close',
+      riskGuard: cfg.riskGuard,
       stepSize: market.stepSize, stepPrice: market.stepPrice,
     };
     this.grid = buildGrid({ lower: this.config.lower, upper: this.config.upper, gridCount: this.config.gridCount });
     this._recomputeRisk();
+    this._initRiskGuard();
     this._refillPausedUntil = 0; this._cancelTimes = []; // fresh start clears any back-off
     this._retryQueue = []; this._noPosStreak = 0;
     this._placementProgress = null;
+    this._riskCancelQueue.clear();
+    this._riskStopPromise = null; this._lastRiskAlertKey = null;
     this.recovery = false;
 
     // record the starting equity up front (margin pre-check, returnPct, recovery)
@@ -395,6 +573,7 @@ export class GridBot {
     if (!Number.isFinite(this.lastPrice) || this.lastPrice <= 0) {
       throw new Error('未能获取有效的最新价（行情中断），已取消启动以免错挂网格单。请稍后重试。');
     }
+    this._observeRisk(this.lastPrice);
     if (this.lastPrice < this.config.lower * 0.5 || this.lastPrice > this.config.upper * 2) {
       throw new Error(`最新价 ${this.lastPrice} 与网格区间 [${this.config.lower}, ${this.config.upper}] 偏离过大，已取消启动。请刷新行情后重设区间。`);
     }
@@ -431,6 +610,7 @@ export class GridBot {
   }
 
   async stop({ closePosition = true } = {}) {
+    this._invalidateRiskOperations();
     const wasRunning = this.running;
     this._pauseTradingRuntime();
     try {
@@ -479,6 +659,7 @@ export class GridBot {
    */
   async cancelAllOrders() {
     if (!this.config) throw new Error('尚未配置市场，没有可撤的挂单。');
+    this._invalidateRiskOperations();
     const wasRunning = this.running;
     this._pauseTradingRuntime();
     try {
@@ -505,6 +686,7 @@ export class GridBot {
    */
   async adjustRange({ lower, upper }) {
     if (!this.running || !this.config) throw new Error('网格未在运行，无法调整区间。');
+    this._invalidateRiskOperations();
     const lo = Number(lower), hi = Number(upper);
     if (!Number.isFinite(lo) || !Number.isFinite(hi) || !(hi > lo)) throw new Error('上边界必须大于下边界。');
     const price = this.lastPrice;
@@ -565,6 +747,13 @@ export class GridBot {
     if (this.outOfRange) throw new Error('价格在区间外，暂不能补格；等价格回到区间内再操作。');
     if (this._refillPausedUntil && Date.now() < this._refillPausedUntil) {
       throw new Error('订单频繁被取消的保护期内，暂不补格，请稍后再试。');
+    }
+    const riskDecision = this._evaluateRisk();
+    if (riskDecision?.level === 'emergency') {
+      throw new Error('风险闸门已进入紧急保护，暂不能补格；请先确认人工处置结果。');
+    }
+    if (riskDecision?.level === 'soft') {
+      throw new Error('风险闸门正在软保护，暂不补挂新的开仓单；平仓/只减仓订单仍可执行。');
     }
     const price = this.lastPrice;
     if (!Number.isFinite(price) || price <= 0) throw new Error('未能获取有效最新价，请稍后重试。');
@@ -747,6 +936,11 @@ export class GridBot {
     // recovery legs need no extra margin and are never blocked — dropping a
     // take-profit leg would strand its inventory without an exit order.
     if (opening && !o.recovery && this._refillPausedUntil && Date.now() < this._refillPausedUntil) return;
+    const sizeBase = Number(o.sizeBase) > 0 ? Number(o.sizeBase) : this.config.sizeBase; // per-order override (partial fills)
+    if (!this._riskAllowsOrder(o, opening, reduceOnly, sizeBase)) {
+      if (o._tries) this._deferRiskRetry(o);
+      return;
+    }
     // INVARIANT: at most ONE resting order per grid level. If this level is
     // already covered (or a placement for it is in flight), skip. Stacking a
     // second order on an occupied level is exactly what made the open-order
@@ -758,7 +952,6 @@ export class GridBot {
     this._pendingLevels.add(lvl);
     const seq = (++this._coidSeq) % 1_000_000;
     const clientOrderId = Number(`${Date.now() % 1_000_000_0}${String(seq).padStart(6, '0')}`);
-    const sizeBase = Number(o.sizeBase) > 0 ? Number(o.sizeBase) : this.config.sizeBase; // per-order override (partial fills)
     try {
       const r = await this.ex.placeLimitOrder({
         marketId: this.config.marketId, side: o.side, price: o.price,
@@ -771,7 +964,7 @@ export class GridBot {
         return null;
       });
       if (r?.orderId) {
-        this.active.set(String(r.orderId), { levelIndex: lvl, side: o.side, price: o.price, sizeBase, opening, recovery: !!o.recovery, placedAt: Date.now() });
+        this.active.set(String(r.orderId), { levelIndex: lvl, side: o.side, price: o.price, sizeBase, opening, reduceOnly, recovery: !!o.recovery, placedAt: Date.now() });
         this._markPlacementConfirmed(o);
       }
     } finally {
@@ -791,6 +984,12 @@ export class GridBot {
       return;
     }
     const ready = [];
+    // Initial startup deliberately preserves the existing full ladder. The
+    // gate still evaluates the real position on each fill; projection is for
+    // manual/refill batches where a new batch itself is the risk decision.
+    const projectBatchRisk = this._placementProgress?.action !== 'start';
+    let projectedPositionSize = projectBatchRisk
+      ? Number(this.ex.getPosition?.(this.config.marketId)?.sizeBase) || 0 : null;
     const reservedLevels = new Set();
     for (const o of orders) {
       const opening = o.opening !== false;
@@ -806,9 +1005,17 @@ export class GridBot {
         continue;
       }
       reservedLevels.add(levelIndex);
+      const sizeBase = Number(o.sizeBase) > 0 ? Number(o.sizeBase) : this.config.sizeBase;
+      if (!this._riskAllowsOrder(o, opening, reduceOnly, sizeBase, projectedPositionSize)) {
+        reservedLevels.delete(levelIndex);
+        if (o._tries) this._deferRiskRetry(o);
+        continue;
+      }
+      if (projectBatchRisk && opening && !reduceOnly && !o.recovery) {
+        projectedPositionSize += o.side === 'sell' ? -sizeBase : sizeBase;
+      }
       const seq = (++this._coidSeq) % 1_000_000;
       const clientOrderId = Number(`${Date.now() % 1_000_000_0}${String(seq).padStart(6, '0')}`);
-      const sizeBase = Number(o.sizeBase) > 0 ? Number(o.sizeBase) : this.config.sizeBase;
       ready.push({
         source: o, opening, reduceOnly, levelIndex, sizeBase,
         payload: {
@@ -825,11 +1032,20 @@ export class GridBot {
         // A fill during startup can occupy a future seed level. Recheck
         // immediately before each batch so the closing leg wins and no duplicate
         // opening order is stacked on that level.
+        let chunkProjectedPositionSize = projectBatchRisk
+          ? Number(this.ex.getPosition?.(this.config.marketId)?.sizeBase) || 0 : null;
         const chunk = ready.slice(offset, offset + batchSize).filter((item) => {
           if (this._pendingLevels.has(item.levelIndex)) return false;
           if ([...this.active.values()].some((a) => a.levelIndex === item.levelIndex)) {
             this._markPlacementConfirmed(item.source);
             return false;
+          }
+          if (!this._riskAllowsOrder(item.source, item.opening, item.reduceOnly, item.sizeBase, chunkProjectedPositionSize)) {
+            if (item.source._tries) this._deferRiskRetry(item.source);
+            return false;
+          }
+          if (projectBatchRisk && item.opening && !item.reduceOnly && !item.source.recovery) {
+            chunkProjectedPositionSize += item.source.side === 'sell' ? -item.sizeBase : item.sizeBase;
           }
           this._pendingLevels.add(item.levelIndex);
           return true;
@@ -858,16 +1074,36 @@ export class GridBot {
           results = null;
         }
         if (results) {
+          let postBatchPositionSize = projectBatchRisk
+            ? Number(this.ex.getPosition?.(this.config.marketId)?.sizeBase) || 0 : null;
           for (let i = 0; i < chunk.length; i++) {
             const item = chunk[i], result = results[i];
             if (result?.orderId) {
-              this.active.set(String(result.orderId), {
+              const orderId = String(result.orderId);
+              this.active.set(orderId, {
                 levelIndex: item.levelIndex, side: item.source.side,
                 price: Number(result.price ?? item.source.price),
                 sizeBase: Number(result.sizeBase ?? item.sizeBase),
-                opening: item.opening, recovery: !!item.source.recovery, placedAt: Date.now(),
+                opening: item.opening, reduceOnly: item.reduceOnly, recovery: !!item.source.recovery, placedAt: Date.now(),
               });
-              this._markPlacementConfirmed(item.source);
+              const allowed = this._riskAllowsOrder(
+                item.source, item.opening, item.reduceOnly,
+                Number(result.sizeBase ?? item.sizeBase), postBatchPositionSize,
+              );
+              if (!allowed) {
+                // The risk state may have changed while the batch request was
+                // in flight. Keep the result tracked, then let the same
+                // authoritative cancellation path remove it before it can
+                // remain as an unguarded opening order.
+                if (this._riskDecision?.level !== 'emergency') this._riskCancelQueue.add(orderId);
+              } else {
+                this._markPlacementConfirmed(item.source);
+                if (projectBatchRisk && item.opening && !item.reduceOnly && !item.source.recovery) {
+                  postBatchPositionSize += item.source.side === 'sell'
+                    ? -Number(result.sizeBase ?? item.sizeBase)
+                    : Number(result.sizeBase ?? item.sizeBase);
+                }
+              }
             } else {
               this._placeFails++; this._lastFailAt = Date.now();
               const error = new Error(`批量下单中的 level ${item.levelIndex} 未被交易所确认。`);
@@ -875,6 +1111,7 @@ export class GridBot {
               this._queueRetry({ ...item.source, opening: item.opening, reduceOnly: item.reduceOnly, sizeBase: item.sizeBase }, error);
             }
           }
+          if (this._riskDecision?.level !== 'emergency') this._drainRiskCancelQueue().catch(() => {});
         }
         for (const item of chunk) this._pendingLevels.delete(item.levelIndex);
         this._changed();
@@ -923,6 +1160,14 @@ export class GridBot {
       this._retryQueue.push(queued);
     }
     this._markPlacementPending(queued);
+  }
+
+  _deferRiskRetry(o) {
+    const nextAt = Date.now() + Math.max(5_000, Number(this.riskGuard?.config?.stableResumeMs) || 60_000);
+    const existing = this._retryQueue.find((x) => x.levelIndex === o.levelIndex && x._placementId === o._placementId);
+    if (existing) existing._nextAt = Math.max(existing._nextAt, nextAt);
+    else this._retryQueue.push({ ...o, _nextAt: nextAt, _lastError: '风险闸门软保护，暂缓开仓重试' });
+    this._markPlacementPending(o);
   }
 
   /** Retry due placements (driven by price ticks + reconcile timer). */
@@ -1017,6 +1262,12 @@ export class GridBot {
       this.stats.gridProfit = round2(this.stats.gridProfit + sp * fillSize);
     }
 
+    const riskDecision = this._evaluateRisk();
+    if (riskDecision?.level === 'emergency') {
+      this._changed();
+      return;
+    }
+
     // Recovery-ladder fills are pure reduce-only EXITS of stranded inventory —
     // never re-quote a replacement for them.
     if (!isRecovery && this.grid) {
@@ -1032,7 +1283,9 @@ export class GridBot {
 
   _handlePrice(p) {
     if (p.marketId !== this.config.marketId) return;
-    this.lastPrice = p.price;
+    this.lastPrice = Number(p.price);
+    const riskDecision = this._observeRisk(this.lastPrice, normalizeRiskTimestamp(p.timestamp ?? p.time));
+    if (riskDecision?.level === 'emergency') return;
     this._drainRetryQueue().catch(() => {});
     if (this.recovery) { this._manageRecoveryStandalone(); return; }
     const out = p.price < this.config.lower || p.price > this.config.upper;
@@ -1146,6 +1399,7 @@ export class GridBot {
       if (!pos || !pos.sizeBase) throw new Error('该市场当前没有持仓，无需回收。');
       const price = await this.ex.getPrice(market.marketId);
       if (!Number.isFinite(price) || price <= 0) throw new Error('未能获取有效最新价，请稍后重试。');
+      this._invalidateRiskOperations();
       // 阶梯间距：入参 -> 上次网格间距 -> 现价的 0.15%
       let spacing = Number(cfg.spacing) || this.config?.spacing || this.grid?.spacing;
       if (!(spacing > 0)) spacing = Math.max(market.stepPrice || 0.1, price * 0.0015);
@@ -1160,6 +1414,8 @@ export class GridBot {
         aboveEntryOnly: !!cfg.aboveEntryOnly, // 只在成本价上方(多)/下方(空)、即不亏的价位才挂减仓单
       };
       this.grid = null; this.risk = null;
+      this.riskGuard = null; this._riskDecision = null;
+      this._riskCancelQueue.clear();
       this.recovery = true; this.outOfRange = false; this.lastPrice = price;
       this._noPosStreak = 0; this._retryQueue = [];
       this._placementProgress = null;
@@ -1191,6 +1447,7 @@ export class GridBot {
   async closePositionNow(marketId) {
     const mId = Number(marketId ?? this.config?.marketId);
     if (!Number.isFinite(mId)) throw new Error('未指定市场，无法平仓。');
+    this._invalidateRiskOperations();
     const wasRunning = this.running;
     this._pauseTradingRuntime();
     try {
@@ -1495,6 +1752,7 @@ export class GridBot {
       lastPrice: this.lastPrice != null ? round2(this.lastPrice) : null,
       outOfRange: this.outOfRange,
       risk: this.risk,
+      riskGuard: this.riskGuard?.state() ?? null,
       stats: this.stats,
       openOrders: this.active.size,
       exchangeOpenOrders: this._exchangeOpenOrders,
@@ -1533,3 +1791,20 @@ function round2(x) { return Math.round(x * 100) / 100; }
 function round6(x) { return Math.round(x * 1e6) / 1e6; }
 function roundPrice(x) { return Number.isFinite(Number(x)) ? Math.round(Number(x) * 1e8) / 1e8 : null; }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function normalizeRiskTimestamp(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp)) return Date.now();
+  // Some venue feeds expose Unix seconds while the bot's risk windows are ms.
+  return timestamp >= 1_000_000_000 && timestamp < 100_000_000_000
+    ? timestamp * 1000 : timestamp;
+}
+function riskReasonText(reason) {
+  return {
+    'shock-move': '短时价格冲击',
+    'one-sided-move': '轻微单边行情',
+    'max-position': '持仓达到上限',
+    'liquidation-distance': '强平距离过近',
+    drawdown: '账户回撤超限',
+    stabilizing: '行情仍在稳定观察期',
+  }[reason] || reason || '账户/行情风险';
+}

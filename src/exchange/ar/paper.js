@@ -226,6 +226,7 @@ export class PaperExchange extends EventEmitter {
   _matchFills(marketId, price) {
     for (const order of [...this.orders.values()]) {
       if (order.marketId !== marketId) continue;
+      if (!this.orders.has(order.orderId)) continue;
       if (!(order.side === 'buy' ? price <= order.price : price >= order.price)) continue;
       if (order.reduceOnly && !this._reduces(marketId, order.side)) { this.orders.delete(order.orderId); continue; }
       this.orders.delete(order.orderId);
