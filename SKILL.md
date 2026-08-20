@@ -62,3 +62,4 @@
 - 2026-08-20：回归对照发现，PopDEX 的自有 `_pendingOrders` 必须同时参与全局写入屏障，并在后台权威发现时注册到通用 `_tracked`；只清 pending 映射而不接管订单会丢失后续成交跟踪。Phoenix/Phoenix2 的 Solana 确认超时还必须把异常中的 `txSignature` 回写 pending，成交历史恢复才可继续。
 - 2026-08-20：成交结果缓存只能阻断同一委托的幂等重试，不应阻断无关的网格反向补单；新增交易所市场精度应优先使用权威市场元数据，不能把单一 BTC 合约的 LOT/tick 常量扩展到所有市场。
 - 2026-08-20：上述回归缺口已用精确 clientOid、请求/远端 client id 别名交集、委托数量校验和统一 pending 屏障收敛；N1/Phoenix/Phoenix2 的市场精度入口与原始 tick 转换也必须有直接回归断言，不能只在夹具中手工注入内部 map。
+- 2026-08-20：成交结果缓存没有稳定 client id 时必须拒绝消费；N1、Phoenix、PopDEX 的 live 开仓都要先校验稳定请求 id，PopDEX 的 clientOid 需要由请求 id 确定性生成，避免不确定重试生成第二笔订单。

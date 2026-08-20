@@ -9,7 +9,7 @@
 - 2026-08-19（Asia/Shanghai）：进一步补齐 Nado 普通 PostOnly 的 digest→权威挂单发现、空/失败写响应保护，并加入 N1 session 刷新、Phoenix 确认超时和 Nado 普通下单—查询—撤单 mock 测试；Nado reduce-only maker 仍明确拒绝。
 - 2026-08-20（Asia/Shanghai）：补齐 N1/Phoenix/Phoenix2 成交收敛：N1 使用 `items + actionId`，Phoenix/Phoenix2 使用精确交易签名；覆盖 fills-only 回执、后台成交清理 pending/write、短期结果消费防重发，以及部分成交在远端订单消失后的聚合事件；`npm test`、专项生命周期、配置和 PopDEX 回归均通过。
 - 2026-08-20（Asia/Shanghai）：再次回归 N1、Phoenix、Phoenix2、PopDEX：专项与全量测试均通过，策略文件未改；一致性审阅发现 PopDEX pending 订单的写入屏障/后台 tracking 不完整、Phoenix 确认超时未把 txSignature 回写 pending，另有精度硬编码、PopDEX 小仓位平仓数量抬高和成交结果缓存阻断无关写入等风险，暂未改业务代码。
-- 2026-08-20（Asia/Shanghai）：修复上述回归问题并提交 `a269931`、`b452dca`；PopDEX 精确 clientOid 后台接管进入 `_tracked`，未完成订单发现阻断撤单/撤全/平仓，reduce-only 平仓不再向上抬数量；Phoenix/Phoenix2 超时签名回写 pending；N1/Phoenix/Phoenix2 使用权威市场精度，成交缓存增加数量与 client-id 别名校验；`npm test`、配置预检、语法检查均通过，未发送真实订单。
+- 2026-08-20（Asia/Shanghai）：修复上述回归问题并提交 `a269931`、`b452dca`、`d69f08d`；PopDEX 精确 clientOid 后台接管进入 `_tracked`，未完成订单发现阻断撤单/撤全/平仓，reduce-only 平仓不再向上抬数量；Phoenix/Phoenix2 超时签名回写 pending；N1/Phoenix/Phoenix2 使用权威市场精度，成交缓存要求数量与稳定 client-id/别名精确匹配；缺少稳定 id 的 live 开仓 fail-closed，`npm test`、配置预检、语法检查均通过，未发送真实订单。
 
 ## 当前任务
 
