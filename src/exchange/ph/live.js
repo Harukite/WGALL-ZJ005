@@ -36,7 +36,11 @@ function loadKeypair(privateKey, keypairPath, label) {
 
 function roundLot(size, lotSize) {
   if (!(size > 0) || !(lotSize > 0)) return 0;
-  return Number((Math.floor(size / lotSize + 1e-12) * lotSize).toFixed(8));
+  return Number((Math.floor(size / lotSize + 1e-12) * lotSize).toPrecision(15));
+}
+
+function powerOfTen(exponent) {
+  return Number(`1e${exponent >= 0 ? '+' : ''}${exponent}`);
 }
 
 function marketPrecision(market) {
@@ -45,8 +49,8 @@ function marketPrecision(market) {
   if (!Number.isInteger(baseLotsDecimals) || !(tickSizeInQuoteLots > 0)) {
     throw new Error('Phoenix 市场元数据缺少有效的 tickSize/baseLotsDecimals');
   }
-  const lotSize = 10 ** -baseLotsDecimals;
-  const priceStep = tickSizeInQuoteLots * 10 ** (baseLotsDecimals - QUOTE_LOTS_DECIMALS);
+  const lotSize = powerOfTen(-baseLotsDecimals);
+  const priceStep = tickSizeInQuoteLots * powerOfTen(baseLotsDecimals - QUOTE_LOTS_DECIMALS);
   if (!(lotSize > 0) || !(priceStep > 0) || !Number.isFinite(lotSize) || !Number.isFinite(priceStep)) {
     throw new Error('Phoenix 市场元数据无法转换为有效的价格/数量精度');
   }
@@ -56,7 +60,7 @@ function marketPrecision(market) {
 function ticksToPrice(priceTicks, precision) {
   const ticks = Number(priceTicks);
   if (!Number.isFinite(ticks)) return 0;
-  return ticks * precision.tickSizeInQuoteLots * 10 ** precision.baseLotsDecimals / 10 ** QUOTE_LOTS_DECIMALS;
+  return ticks * precision.tickSizeInQuoteLots * powerOfTen(precision.baseLotsDecimals - QUOTE_LOTS_DECIMALS);
 }
 
 function fromPhoenixSide(side) {
@@ -136,8 +140,20 @@ export class PhoenixExchange extends LiveVenueExchange {
       if (!selected) throw new Error(this.id + ' 未找到配置的市场 ' + this.symbol);
       markets = [selected];
     }
+    const rows = this._configureMarkets(markets);
+    if (!rows.length) throw new Error('Phoenix 未返回可交易市场');
+    this._setMarkets(rows, 100_000);
+    this._watch.add(rows[0].marketId);
+    await this._refreshMarket(rows[0].marketId).then((snapshot) => this._applySnapshot(rows[0].marketId, snapshot));
+    this.start();
+    console.log('[' + this.id + '] authority=' + this.authority);
+    return true;
+  }
+
+  _configureMarkets(markets) {
     this._marketPrecision.clear();
-    const rows = markets.map((market, index) => {
+    this.symbolByMarket.clear();
+    return markets.map((market, index) => {
       const marketId = index + 1;
       const symbol = String(market.symbol);
       const precision = marketPrecision(market);
@@ -155,13 +171,6 @@ export class PhoenixExchange extends LiveVenueExchange {
         maxLeverage: 30,
       };
     });
-    if (!rows.length) throw new Error('Phoenix 未返回可交易市场');
-    this._setMarkets(rows, 100_000);
-    this._watch.add(rows[0].marketId);
-    await this._refreshMarket(rows[0].marketId).then((snapshot) => this._applySnapshot(rows[0].marketId, snapshot));
-    this.start();
-    console.log('[' + this.id + '] authority=' + this.authority);
-    return true;
   }
 
   disconnect() {
@@ -280,7 +289,7 @@ export class PhoenixExchange extends LiveVenueExchange {
     for (const row of subaccount.positions || []) {
       if (String(row.symbol || '').toUpperCase() !== String(symbol).toUpperCase()) continue;
       position = num(row.basePositionLots) * precision.lotSize;
-      entryPrice = num(row.entryPriceUsd, ticksToPrice(row.entryPriceTicks, precision));
+      entryPrice = num(row.entryPriceUsd ?? ticksToPrice(row.entryPriceTicks, precision));
       if (entryPrice > 0) unrealizedPnl = position * (price - entryPrice);
       break;
     }
@@ -290,7 +299,7 @@ export class PhoenixExchange extends LiveVenueExchange {
       for (const row of block.orders || []) {
         if (String(row.status || '').toLowerCase() === 'cancelled') continue;
         const sizeBase = num(row.sizeRemainingLots ?? row.initialSizeLots) * precision.lotSize;
-        const priceValue = num(row.priceUsd, ticksToPrice(row.priceTicks, precision));
+        const priceValue = num(row.priceUsd ?? ticksToPrice(row.priceTicks, precision));
         const sequence = row.orderSequenceNumber;
         if (!(sizeBase > 0) || !(priceValue > 0)) {
           throw new Error(this.id + ' 权威挂单快照包含无效价格或数量，拒绝继续交易');
@@ -442,6 +451,7 @@ export class PhoenixExchange extends LiveVenueExchange {
       ...order,
       marketId,
       clientOrderId: String(remoteClientOrderId),
+      requestClientOrderId: stableId(order.clientOrderId),
       price,
       sizeBase: size,
     }, remoteClientOrderId, {

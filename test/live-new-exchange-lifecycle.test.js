@@ -227,6 +227,57 @@ await n1Session._ensureSession();
 assert.equal(sessionRefreshes, 1, 'N1 must reuse a still-valid session');
 n1Session.stop();
 
+const n1Precision = new N1Exchange();
+n1Precision._configureMarket({ symbol: 'ETHUSDC', priceDecimals: 2, sizeDecimals: 4 }, 100);
+const [n1PrecisionMarket] = await n1Precision.getMarkets();
+assert.equal(n1PrecisionMarket.stepPrice, 0.01, 'N1 must use authoritative priceDecimals');
+assert.equal(n1PrecisionMarket.stepSize, 0.0001, 'N1 must use authoritative sizeDecimals');
+assert.throws(
+  () => n1Precision._configureMarket({ symbol: 'ETHUSDC', priceDecimals: 2 }, 100),
+  /priceDecimals\/sizeDecimals 元数据/,
+  'N1 must fail closed when market precision metadata is incomplete',
+);
+
+const phoenixPrecision = new PhoenixExchange({ venue: 'ph' });
+const phoenixRows = phoenixPrecision._configureMarkets([{
+  symbol: 'ALT-PERP',
+  tickSize: 25,
+  baseLotsDecimals: 2,
+}]);
+phoenixPrecision._setMarkets(phoenixRows, 100);
+phoenixPrecision.client = {};
+phoenixPrecision.kp = {};
+phoenixPrecision.conn = {};
+phoenixPrecision.authority = 'authority';
+phoenixPrecision._mark = async () => 100;
+phoenixPrecision._traderState = async () => ({
+  snapshot: {
+    subaccounts: [{
+      subaccountIndex: 0,
+      collateral: '1000000',
+      positions: [{ symbol: 'ALT-PERP', basePositionLots: '3', entryPriceTicks: '40000' }],
+      orders: [{
+        symbol: 'ALT-PERP',
+        orders: [{
+          status: 'open',
+          priceTicks: '40000',
+          sizeRemainingLots: '2',
+          orderSequenceNumber: '1',
+          side: 'bid',
+        }],
+      }],
+    }],
+  },
+});
+const phoenixPrecisionSnapshot = await phoenixPrecision._refreshMarket(1);
+assert.equal(phoenixRows[0].stepPrice, 0.0025, 'Phoenix must convert SDK tick metadata to display price step');
+assert.equal(phoenixRows[0].stepSize, 0.01, 'Phoenix must convert SDK base lot metadata to base size step');
+assert.equal(phoenixPrecisionSnapshot.position.sizeBase, 0.03, 'Phoenix positions must use the market base lot size');
+assert.equal(phoenixPrecisionSnapshot.position.entryPrice, 100, 'Phoenix must convert raw entry ticks using market metadata');
+assert.equal(phoenixPrecisionSnapshot.openOrders[0].price, 100, 'Phoenix must convert raw order ticks using market metadata');
+assert.equal(phoenixPrecisionSnapshot.openOrders[0].sizeBase, 0.02, 'Phoenix open orders must use the market base lot size');
+phoenixPrecision.stop();
+
 for (const [Venue, venue] of [[PhoenixExchange, 'ph'], [Phoenix2Exchange, 'ph2']]) {
   const precision = makePhoenixHarness(Venue, venue);
   precision.ex._marketPrecision.set(1, {

@@ -240,10 +240,22 @@ export class LiveVenueExchange extends EventEmitter {
     if (expected?.side && order?.side && expected.side !== order.side) return false;
     if (expected?.levelIndex != null && order?.levelIndex != null
       && Number(expected.levelIndex) !== Number(order.levelIndex)) return false;
+    const expectedClientIds = new Set(
+      [expected?.clientOrderId, expected?.requestClientOrderId].map(stableId).filter(Boolean),
+    );
+    const actualClientIds = new Set(
+      [order?.clientOrderId, order?.requestClientOrderId].map(stableId).filter(Boolean),
+    );
+    if (expectedClientIds.size && actualClientIds.size
+      && ![...expectedClientIds].some((clientId) => actualClientIds.has(clientId))) return false;
     const expectedPrice = Number(expected?.price);
     const requestedPrice = Number(order?.price);
-    return !(Number.isFinite(expectedPrice) && Number.isFinite(requestedPrice)
-      && Math.abs(expectedPrice - requestedPrice) > Math.max(1e-12, Math.abs(expectedPrice) * 1e-10));
+    if (Number.isFinite(expectedPrice) && Number.isFinite(requestedPrice)
+      && Math.abs(expectedPrice - requestedPrice) > Math.max(1e-12, Math.abs(expectedPrice) * 1e-10)) return false;
+    const expectedSize = Number(expected?.sizeBase);
+    const requestedSize = Number(order?.sizeBase);
+    return !(Number.isFinite(expectedSize) && Number.isFinite(requestedSize)
+      && Math.abs(expectedSize - requestedSize) > Math.max(1e-12, Math.max(Math.abs(expectedSize), Math.abs(requestedSize)) * 1e-9));
   }
 
   _publishPendingPlacementOutcome(pending) {

@@ -335,6 +335,7 @@ export class PopdexExchange extends LiveVenueExchange {
       const error = new Error(`PopDEX 存在尚未完成真实订单发现，拒绝继续${action}：${clientOid}`);
       error.pending = true;
       error.clientOrderId = clientOid;
+      error.clientOid = clientOid;
       throw error;
     }
     return super._assertNoPendingPlacements(action);

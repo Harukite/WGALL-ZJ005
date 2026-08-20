@@ -37,6 +37,21 @@ function signedPerpSize(perp) {
   return size;
 }
 
+function n1MarketPrecision(market) {
+  const symbol = String(market?.symbol || '').trim();
+  const priceDecimals = Number(market?.priceDecimals);
+  const sizeDecimals = Number(market?.sizeDecimals);
+  if (!symbol || !Number.isInteger(priceDecimals) || priceDecimals < 0
+    || !Number.isInteger(sizeDecimals) || sizeDecimals < 0) {
+    throw new Error('N1 缺少目标市场的 priceDecimals/sizeDecimals 元数据');
+  }
+  return {
+    symbol,
+    stepSize: Number(`1e-${sizeDecimals}`),
+    stepPrice: Number(`1e-${priceDecimals}`),
+  };
+}
+
 export class N1Exchange extends LiveVenueExchange {
   constructor(opts = {}) {
     super({
@@ -71,29 +86,28 @@ export class N1Exchange extends LiveVenueExchange {
     if (ids.length !== 1) throw new Error('N1 需要恰好 1 个账户，当前数量=' + ids.length);
     this.accountId = ids[0];
     const market = this.nord.markets?.find((row) => Number(row.marketId) === this._remoteMarketId);
-    const priceDecimals = Number(market?.priceDecimals);
-    const sizeDecimals = Number(market?.sizeDecimals);
-    if (!market || !Number.isInteger(priceDecimals) || priceDecimals < 0
-      || !Number.isInteger(sizeDecimals) || sizeDecimals < 0) {
-      throw new Error('N1 缺少目标市场的 priceDecimals/sizeDecimals 元数据');
-    }
     const stats = await this.nord.getMarketStats({ marketId: this._remoteMarketId });
     const price = num(stats?.perpStats?.mark_price, num(stats?.indexPrice, 100_000));
-    this._setMarkets([{
-      marketId: INTERNAL_MARKET_ID,
-      name: market.symbol,
-      displayName: market.symbol,
-      symbol: market.symbol,
-      lastPrice: price,
-      stepSize: 10 ** -sizeDecimals,
-      stepPrice: 10 ** -priceDecimals,
-      minOrderSize: 10 ** -sizeDecimals,
-      maxLeverage: 30,
-    }], price);
+    this._configureMarket(market, price);
     this._watch.add(INTERNAL_MARKET_ID);
     await this._refreshMarket(INTERNAL_MARKET_ID).then((snapshot) => this._applySnapshot(INTERNAL_MARKET_ID, snapshot));
     this.start();
     return true;
+  }
+
+  _configureMarket(market, price) {
+    const precision = n1MarketPrecision(market);
+    this._setMarkets([{
+      marketId: INTERNAL_MARKET_ID,
+      name: precision.symbol,
+      displayName: precision.symbol,
+      symbol: precision.symbol,
+      lastPrice: price,
+      stepSize: precision.stepSize,
+      stepPrice: precision.stepPrice,
+      minOrderSize: precision.stepSize,
+      maxLeverage: 30,
+    }], price);
   }
 
   async reconnect() {
@@ -289,6 +303,7 @@ export class N1Exchange extends LiveVenueExchange {
     const pending = this._beginPendingPlacement({
       ...order,
       clientOrderId: String(remoteClientOrderId),
+      requestClientOrderId: stableId(order.clientOrderId),
     }, remoteClientOrderId);
     try {
       const receipt = await this.user.placeOrder({

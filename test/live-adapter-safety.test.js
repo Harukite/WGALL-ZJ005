@@ -58,10 +58,37 @@ assert.doesNotThrow(
   () => cachedOutcome._assertNoPendingPlacements('下单'),
   'a resolved fill cache must not block an unrelated grid write',
 );
+assert.equal(
+  cachedOutcome._takePendingPlacementOutcome({ marketId: 1, side: 'buy', price: 99, sizeBase: 2 }),
+  null,
+  'a different order size must not consume a cached fill outcome',
+);
 assert.deepEqual(
   cachedOutcome._takePendingPlacementOutcome({ marketId: 1, side: 'buy', price: 99, sizeBase: 1 }),
   { orderId: 'cached-fill-1', price: 99, sizeBase: 1, filled: true },
   'the same order must still consume its cached fill outcome without resubmitting',
+);
+
+const aliasedOutcome = new LiveVenueExchange({ venue: 'aliased-outcome-test', pollMs: 500 });
+const aliasedPending = aliasedOutcome._beginPendingPlacement(
+  { marketId: 1, side: 'buy', price: 99, sizeBase: 1, clientOrderId: 'remote-1', requestClientOrderId: 'request-1' },
+  'remote-1',
+);
+aliasedOutcome._markPendingPlacementFilled(aliasedPending, {
+  orderId: 'aliased-fill-1',
+  price: 99,
+  sizeBase: 1,
+});
+aliasedOutcome._publishPendingPlacementOutcome(aliasedPending);
+assert.equal(
+  aliasedOutcome._takePendingPlacementOutcome({ marketId: 1, side: 'buy', price: 99, sizeBase: 1, clientOrderId: 'request-2' }),
+  null,
+  'a different request client id must not consume a cached fill outcome',
+);
+assert.equal(
+  aliasedOutcome._takePendingPlacementOutcome({ marketId: 1, side: 'buy', price: 99, sizeBase: 1, clientOrderId: 'request-1' })?.orderId,
+  'aliased-fill-1',
+  'the original request client id must consume the aliased cached fill outcome',
 );
 
 const cancelledAfterPartial = new LiveVenueExchange({ venue: 'cancel-partial-test', pollMs: 500 });
