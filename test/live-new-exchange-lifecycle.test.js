@@ -41,7 +41,7 @@ function makeN1Harness({ placeResult, placeError = null } = {}) {
 }
 
 function makePhoenixHarness(Venue, venue) {
-  const state = { openOrders: [], placeArgs: null, sendCalls: 0 };
+  const state = { openOrders: [], placeArgs: null, baseUnits: null, sendCalls: 0 };
   const ex = new Venue({
     venue,
     orderGapMs: 0,
@@ -50,12 +50,15 @@ function makePhoenixHarness(Venue, venue) {
   });
   ex.client = {
     orderPackets: {
-      buildLimitOrderPacket: async ({ side }) => ({
-        side,
-        priceInTicks: 99,
-        numBaseLots: 1000,
-        orderFlags: 0,
-      }),
+      buildLimitOrderPacket: async ({ side, baseUnits }) => {
+        state.baseUnits = baseUnits;
+        return {
+          side,
+          priceInTicks: 99,
+          numBaseLots: 1000,
+          orderFlags: 0,
+        };
+      },
     },
     ixs: {
       buildPlacePostOnlyOrder: async (args) => {
@@ -69,6 +72,12 @@ function makePhoenixHarness(Venue, venue) {
   ex.conn = {};
   ex.authority = 'authority';
   ex.symbolByMarket.set(1, 'BTC-PERP');
+  ex._marketPrecision.set(1, {
+    baseLotsDecimals: 4,
+    tickSizeInQuoteLots: 1,
+    lotSize: 0.0001,
+    priceStep: 0.01,
+  });
   ex._refreshMarket = async () => ({
     price: 100,
     position: null,
@@ -219,6 +228,17 @@ assert.equal(sessionRefreshes, 1, 'N1 must reuse a still-valid session');
 n1Session.stop();
 
 for (const [Venue, venue] of [[PhoenixExchange, 'ph'], [Phoenix2Exchange, 'ph2']]) {
+  const precision = makePhoenixHarness(Venue, venue);
+  precision.ex._marketPrecision.set(1, {
+    baseLotsDecimals: 2,
+    tickSizeInQuoteLots: 25,
+    lotSize: 0.01,
+    priceStep: 0.25,
+  });
+  await precision.ex.placeLimitOrder({ ...order, sizeBase: 0.019 });
+  assert.equal(precision.state.baseUnits, '0.01', venue + ' must round size using the market lot metadata');
+  precision.ex.stop();
+
   const harness = makePhoenixHarness(Venue, venue);
   const placed = await harness.ex.placeLimitOrder(order);
   assert.equal(placed.orderId, '100:1', venue + ' must discover the authoritative Phoenix order id');
@@ -250,6 +270,24 @@ for (const [Venue, venue] of [[PhoenixExchange, 'ph'], [Phoenix2Exchange, 'ph2']
   assert.deepEqual((await pending.ex.fetchOpenOrders(1)).map((row) => row.orderId), ['200:2']);
   assert.equal(pending.ex._pendingPlacements.size, 0, venue + ' must resolve delayed order discovery');
   pending.ex.stop();
+
+  const timeout = makePhoenixHarness(Venue, venue);
+  const timeoutError = new Error('confirmation timeout');
+  timeoutError.pending = true;
+  timeoutError.txSignature = 'signature-timeout';
+  timeout.ex._sendIxs = async () => { throw timeoutError; };
+  await assert.rejects(
+    timeout.ex.placeLimitOrder(order),
+    (error) => error?.pending === true && error?.txSignature === 'signature-timeout',
+    venue + ' confirmation timeout must remain pending with its transaction signature',
+  );
+  const timeoutPending = timeout.ex._pendingPlacements.values().next().value;
+  assert.equal(
+    timeoutPending?.txSignature,
+    'signature-timeout',
+    venue + ' must retain the transaction signature on pending placement state',
+  );
+  timeout.ex.stop();
 
   const filled = makePhoenixHarness(Venue, venue);
   filled.ex.client.api = {

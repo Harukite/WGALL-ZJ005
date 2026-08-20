@@ -303,11 +303,79 @@ try {
     tradingState.hideOrders = false;
     assert.deepEqual((await delayedExchange.fetchOpenOrders(1)).map((row) => row.orderId), ['42']);
     assert.equal(delayedExchange._pendingOrders.size, 0, 'later authoritative discovery must resolve pending state');
+    assert.equal(delayedExchange.getOpenOrders(1).length, 1, 'later authoritative discovery must register the order for fill tracking');
     await delayedExchange.cancelOrder(1, '42');
   } finally {
     delayedExchange.stop();
     delayedExchange.disconnect();
   }
+
+  const pendingClientOid = '0x' + '11'.repeat(32);
+  const mismatchedClientOid = '0x' + '22'.repeat(32);
+  const mismatchExchange = new PopdexExchange();
+  mismatchExchange._pendingOrders.set(pendingClientOid, {
+    clientOid: pendingClientOid,
+    order: { marketId: 1, side: 'buy', price: 99, sizeBase: 0.2 },
+    previousIds: new Set(),
+  });
+  mismatchExchange._resolvePendingOrders([{
+    orderId: '43',
+    clientOid: mismatchedClientOid,
+    side: 'buy',
+    price: 99,
+    sizeBase: 0.2,
+  }]);
+  assert.equal(mismatchExchange._pendingOrders.size, 1, 'a mismatched clientOid must not be associated by price and size');
+  assert.equal(mismatchExchange._tracked.size, 0, 'a mismatched clientOid must not claim an unrelated order');
+
+  const pendingOrderExchange = new PopdexExchange();
+  let blockedWrites = 0;
+  pendingOrderExchange._pendingOrders.set(pendingClientOid, {
+    clientOid: pendingClientOid,
+    order: { marketId: 1, side: 'buy', price: 99, sizeBase: 0.2 },
+    previousIds: new Set(),
+  });
+  pendingOrderExchange._refreshMarket = async () => ({
+    price: 100,
+    position: { sizeBase: 1 },
+    openOrders: [],
+  });
+  pendingOrderExchange._send = async () => { blockedWrites++; };
+  await assert.rejects(
+    pendingOrderExchange.cancelOrder(1, '43'),
+    (error) => error?.pending === true,
+    'unresolved order discovery must block a single-order cancellation',
+  );
+  await assert.rejects(
+    pendingOrderExchange.cancelAll(1),
+    (error) => error?.pending === true,
+    'unresolved order discovery must block cancel-all',
+  );
+  await assert.rejects(
+    pendingOrderExchange.closePosition(1),
+    (error) => error?.pending === true,
+    'unresolved order discovery must block position close',
+  );
+  assert.equal(blockedWrites, 0, 'pending order discovery must not race any follow-up write');
+
+  const closeExchange = new PopdexExchange();
+  closeExchange.address = '0x0000000000000000000000000000000000000001';
+  closeExchange.tickSize = 1;
+  closeExchange.lotSize = 0.0001;
+  closeExchange.minQty = 0.0001;
+  closeExchange.minNotional = 10;
+  closeExchange._refreshMarket = async () => ({
+    price: 100,
+    position: { sizeBase: 0.05 },
+    openOrders: [],
+  });
+  let closeSize;
+  closeExchange._send = async (data) => {
+    const decoded = decodeFunctionData({ abi: placeAbi, data });
+    closeSize = Number(decoded.args[5]) / 1e18;
+  };
+  await closeExchange.closePosition(1);
+  assert.equal(closeSize, 0.05, 'reduce-only close must never round a small position above the actual position');
 
   const uncertainExchange = new PopdexExchange({
     apiUrl: tradingApi.url,

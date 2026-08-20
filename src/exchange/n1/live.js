@@ -70,17 +70,24 @@ export class N1Exchange extends LiveVenueExchange {
     const ids = this.user.accountIds ?? [];
     if (ids.length !== 1) throw new Error('N1 需要恰好 1 个账户，当前数量=' + ids.length);
     this.accountId = ids[0];
+    const market = this.nord.markets?.find((row) => Number(row.marketId) === this._remoteMarketId);
+    const priceDecimals = Number(market?.priceDecimals);
+    const sizeDecimals = Number(market?.sizeDecimals);
+    if (!market || !Number.isInteger(priceDecimals) || priceDecimals < 0
+      || !Number.isInteger(sizeDecimals) || sizeDecimals < 0) {
+      throw new Error('N1 缺少目标市场的 priceDecimals/sizeDecimals 元数据');
+    }
     const stats = await this.nord.getMarketStats({ marketId: this._remoteMarketId });
     const price = num(stats?.perpStats?.mark_price, num(stats?.indexPrice, 100_000));
     this._setMarkets([{
       marketId: INTERNAL_MARKET_ID,
-      name: 'BTC-PERP',
-      displayName: 'BTC-PERP',
-      symbol: 'BTC',
+      name: market.symbol,
+      displayName: market.symbol,
+      symbol: market.symbol,
       lastPrice: price,
-      stepSize: 0.001,
-      stepPrice: 1,
-      minOrderSize: 0.001,
+      stepSize: 10 ** -sizeDecimals,
+      stepPrice: 10 ** -priceDecimals,
+      minOrderSize: 10 ** -sizeDecimals,
       maxLeverage: 30,
     }], price);
     this._watch.add(INTERNAL_MARKET_ID);

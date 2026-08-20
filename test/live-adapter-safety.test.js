@@ -43,6 +43,27 @@ partial._applySnapshot(1, snapshot(-0.4, []));
 assert.equal(partialFills.length, 1, 'confirmed partial execution is emitted after the order closes');
 assert.equal(partialFills[0].sizeBase, 0.4);
 
+const cachedOutcome = new LiveVenueExchange({ venue: 'cached-outcome-test', pollMs: 500 });
+const cachedPending = cachedOutcome._beginPendingPlacement(
+  { marketId: 1, side: 'buy', price: 99, sizeBase: 1 },
+  'cached-client-1',
+);
+assert.equal(cachedOutcome._markPendingPlacementFilled(cachedPending, {
+  orderId: 'cached-fill-1',
+  price: 99,
+  sizeBase: 1,
+}), true);
+cachedOutcome._publishPendingPlacementOutcome(cachedPending);
+assert.doesNotThrow(
+  () => cachedOutcome._assertNoPendingPlacements('下单'),
+  'a resolved fill cache must not block an unrelated grid write',
+);
+assert.deepEqual(
+  cachedOutcome._takePendingPlacementOutcome({ marketId: 1, side: 'buy', price: 99, sizeBase: 1 }),
+  { orderId: 'cached-fill-1', price: 99, sizeBase: 1, filled: true },
+  'the same order must still consume its cached fill outcome without resubmitting',
+);
+
 const cancelledAfterPartial = new LiveVenueExchange({ venue: 'cancel-partial-test', pollMs: 500 });
 const cancelledAfterPartialFills = [];
 cancelledAfterPartial.on('fill', (fill) => cancelledAfterPartialFills.push(fill));

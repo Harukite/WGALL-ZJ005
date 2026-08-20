@@ -20,7 +20,7 @@ import { fetchPhoenixCandles } from './market-data.js';
 
 const DEFAULT_API = 'https://perp-api.phoenix.trade';
 const DEFAULT_RPC = 'https://api.mainnet-beta.solana.com';
-const LOT = 0.0001;
+const QUOTE_LOTS_DECIMALS = 6;
 
 function loadKeypair(privateKey, keypairPath, label) {
   const rawKey = String(privateKey || '').trim();
@@ -34,9 +34,29 @@ function loadKeypair(privateKey, keypairPath, label) {
   return Keypair.fromSecretKey(bs58.decode(raw));
 }
 
-function roundLot(size) {
-  if (!(size > 0)) return 0;
-  return Number((Math.floor(size / LOT + 1e-12) * LOT).toFixed(8));
+function roundLot(size, lotSize) {
+  if (!(size > 0) || !(lotSize > 0)) return 0;
+  return Number((Math.floor(size / lotSize + 1e-12) * lotSize).toFixed(8));
+}
+
+function marketPrecision(market) {
+  const baseLotsDecimals = Number(market?.baseLotsDecimals);
+  const tickSizeInQuoteLots = Number(market?.tickSize);
+  if (!Number.isInteger(baseLotsDecimals) || !(tickSizeInQuoteLots > 0)) {
+    throw new Error('Phoenix 市场元数据缺少有效的 tickSize/baseLotsDecimals');
+  }
+  const lotSize = 10 ** -baseLotsDecimals;
+  const priceStep = tickSizeInQuoteLots * 10 ** (baseLotsDecimals - QUOTE_LOTS_DECIMALS);
+  if (!(lotSize > 0) || !(priceStep > 0) || !Number.isFinite(lotSize) || !Number.isFinite(priceStep)) {
+    throw new Error('Phoenix 市场元数据无法转换为有效的价格/数量精度');
+  }
+  return { baseLotsDecimals, tickSizeInQuoteLots, lotSize, priceStep };
+}
+
+function ticksToPrice(priceTicks, precision) {
+  const ticks = Number(priceTicks);
+  if (!Number.isFinite(ticks)) return 0;
+  return ticks * precision.tickSizeInQuoteLots * 10 ** precision.baseLotsDecimals / 10 ** QUOTE_LOTS_DECIMALS;
 }
 
 function fromPhoenixSide(side) {
@@ -92,6 +112,7 @@ export class PhoenixExchange extends LiveVenueExchange {
     this.conn = null;
     this.authority = '';
     this.symbolByMarket = new Map();
+    this._marketPrecision = new Map();
   }
 
   async init() {
@@ -105,28 +126,32 @@ export class PhoenixExchange extends LiveVenueExchange {
     this.kp = loadKeypair(this.privateKey, this.keypairPath, this.id === 'ph2' ? 'Phoenix2' : 'Phoenix');
     this.authority = this.kp.publicKey.toBase58();
     this.conn = new Connection(this.rpcUrl, 'confirmed');
-    const allSymbols = this.client.exchange.snapshot()?.markets?.map((market) => market.symbol).filter(Boolean) || [];
-    let symbols = allSymbols;
+    const allMarkets = this.client.exchange.snapshot()?.markets?.filter((market) => market?.symbol) || [];
+    let markets = allMarkets;
     if (this.symbol) {
       const requested = this.symbol.toUpperCase().replace(/-USD$/, '').replace(/-PERP$/, '');
-      const selected = allSymbols.find((value) => String(value).toUpperCase() === this.symbol.toUpperCase())
-        || allSymbols.find((value) => String(value).toUpperCase() === requested)
-        || allSymbols.find((value) => String(value).toUpperCase().startsWith(requested));
+      const selected = allMarkets.find((market) => String(market.symbol).toUpperCase() === this.symbol.toUpperCase())
+        || allMarkets.find((market) => String(market.symbol).toUpperCase() === requested)
+        || allMarkets.find((market) => String(market.symbol).toUpperCase().startsWith(requested));
       if (!selected) throw new Error(this.id + ' 未找到配置的市场 ' + this.symbol);
-      symbols = [selected];
+      markets = [selected];
     }
-    const rows = symbols.map((symbol, index) => {
+    this._marketPrecision.clear();
+    const rows = markets.map((market, index) => {
       const marketId = index + 1;
-      this.symbolByMarket.set(marketId, String(symbol));
+      const symbol = String(market.symbol);
+      const precision = marketPrecision(market);
+      this._marketPrecision.set(marketId, precision);
+      this.symbolByMarket.set(marketId, symbol);
       return {
         marketId,
-        name: String(symbol),
-        displayName: String(symbol),
-        symbol: String(symbol),
+        name: symbol,
+        displayName: symbol,
+        symbol,
         lastPrice: index === 0 ? 100_000 : 0,
-        stepSize: LOT,
-        stepPrice: 1,
-        minOrderSize: LOT,
+        stepSize: precision.lotSize,
+        stepPrice: precision.priceStep,
+        minOrderSize: precision.lotSize,
         maxLeverage: 30,
       };
     });
@@ -149,6 +174,7 @@ export class PhoenixExchange extends LiveVenueExchange {
     this.conn = null;
     this.authority = '';
     this.symbolByMarket.clear();
+    this._marketPrecision.clear();
   }
 
   _ensure() {
@@ -159,6 +185,12 @@ export class PhoenixExchange extends LiveVenueExchange {
     const symbol = this.symbolByMarket.get(Number(marketId));
     if (!symbol) throw new Error(this.id + ' 未知市场 marketId=' + marketId);
     return symbol;
+  }
+
+  _precisionForMarket(marketId) {
+    const precision = this._marketPrecision.get(Number(marketId));
+    if (!precision) throw new Error(this.id + ' 缺少市场精度元数据 marketId=' + marketId);
+    return precision;
   }
 
   async getCandles(marketId, intervalSec = 3600, count = 200) {
@@ -233,6 +265,7 @@ export class PhoenixExchange extends LiveVenueExchange {
   async _refreshMarket(marketId) {
     this._ensure();
     const symbol = this._symbolForMarket(marketId);
+    const precision = this._precisionForMarket(marketId);
     const [price, state] = await Promise.all([this._mark(symbol), this._traderState()]);
     if (!state?.snapshot || !Array.isArray(state.snapshot.subaccounts) || !state.snapshot.subaccounts.length) {
       throw new Error(this.id + ' 账户快照格式无效，拒绝继续交易');
@@ -246,8 +279,8 @@ export class PhoenixExchange extends LiveVenueExchange {
     let unrealizedPnl = 0;
     for (const row of subaccount.positions || []) {
       if (String(row.symbol || '').toUpperCase() !== String(symbol).toUpperCase()) continue;
-      position = num(row.basePositionLots) * LOT;
-      entryPrice = num(row.entryPriceUsd ?? row.entryPriceTicks);
+      position = num(row.basePositionLots) * precision.lotSize;
+      entryPrice = num(row.entryPriceUsd, ticksToPrice(row.entryPriceTicks, precision));
       if (entryPrice > 0) unrealizedPnl = position * (price - entryPrice);
       break;
     }
@@ -256,8 +289,8 @@ export class PhoenixExchange extends LiveVenueExchange {
       if (String(block.symbol || '').toUpperCase() !== String(symbol).toUpperCase()) continue;
       for (const row of block.orders || []) {
         if (String(row.status || '').toLowerCase() === 'cancelled') continue;
-        const sizeBase = num(row.sizeRemainingLots ?? row.initialSizeLots) * LOT;
-        const priceValue = num(row.priceUsd ?? row.priceTicks);
+        const sizeBase = num(row.sizeRemainingLots ?? row.initialSizeLots) * precision.lotSize;
+        const priceValue = num(row.priceUsd, ticksToPrice(row.priceTicks, precision));
         const sequence = row.orderSequenceNumber;
         if (!(sizeBase > 0) || !(priceValue > 0)) {
           throw new Error(this.id + ' 权威挂单快照包含无效价格或数量，拒绝继续交易');
@@ -309,6 +342,7 @@ export class PhoenixExchange extends LiveVenueExchange {
     if (!trades?.getTraderTradesHistory) return null;
     const order = pending.order || {};
     const symbol = this._symbolForMarket(order.marketId);
+    const precision = this._precisionForMarket(order.marketId);
     let response;
     try {
       response = await trades.getTraderTradesHistory(this.authority, {
@@ -325,7 +359,7 @@ export class PhoenixExchange extends LiveVenueExchange {
     const priceTicks = pending.metadata?.priceTicks;
     const txSignature = stableId(pending.txSignature);
     if (!(expectedPrice > 0) || !(expectedSize > 0) || priceTicks == null || !txSignature) return null;
-    const targetLots = expectedSize / LOT;
+    const targetLots = expectedSize / precision.lotSize;
     const expectedSign = order.side === 'buy' ? 1 : order.side === 'sell' ? -1 : 0;
     const priceTolerance = Math.max(expectedPrice * 1e-9, 1e-8);
     const grouped = new Map();
@@ -369,8 +403,9 @@ export class PhoenixExchange extends LiveVenueExchange {
     this._assertNoPendingPlacements('下单');
     const marketId = Number(order.marketId);
     const symbol = this._symbolForMarket(marketId);
-    const size = roundLot(Number(order.sizeBase));
-    if (!(size > 0)) throw new Error(this.id + ' size 小于 lot=' + LOT);
+    const precision = this._precisionForMarket(marketId);
+    const size = roundLot(Number(order.sizeBase), precision.lotSize);
+    if (!(size > 0)) throw new Error(this.id + ' size 小于 lot=' + precision.lotSize);
     const price = Number(order.price);
     const before = await this._refreshMarket(marketId);
     this._applySnapshot(marketId, before);
@@ -440,6 +475,7 @@ export class PhoenixExchange extends LiveVenueExchange {
       this._finishPendingWrite(pending.write);
       return result;
     } catch (error) {
+      pending.txSignature = pending.txSignature || stableId(error?.txSignature) || null;
       const filled = await this._resolvePendingPlacementAfterWrite(pending.order);
       if (filled) return filled;
       if (error?.receiptKnown) {
@@ -525,10 +561,11 @@ export class PhoenixExchange extends LiveVenueExchange {
     const position = Number(snapshot.position?.sizeBase || 0);
     if (!position) return true;
     const symbol = this._symbolForMarket(marketId);
+    const precision = this._precisionForMarket(marketId);
     const packet = await this.client.orderPackets.buildMarketOrderPacket({
       symbol,
       side: position > 0 ? PhoenixSide.Ask : PhoenixSide.Bid,
-      baseUnits: String(roundLot(Math.abs(position))),
+      baseUnits: String(roundLot(Math.abs(position), precision.lotSize)),
     });
     packet.orderFlags = OrderFlags.ReduceOnly;
     const ix = await this.client.ixs.buildPlaceMarketOrder({

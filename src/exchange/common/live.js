@@ -182,15 +182,13 @@ export class LiveVenueExchange extends EventEmitter {
   }
 
   _assertNoPendingPlacements(action = '写操作') {
-    if (!this._pendingPlacements.size && !this._pendingWrites.size && !this._resolvedPlacementOutcomes.size) return;
+    if (!this._pendingPlacements.size && !this._pendingWrites.size) return;
     const pendingId = this._pendingPlacements.keys().next().value
-      || this._pendingWrites.keys().next().value
-      || this._resolvedPlacementOutcomes.keys().next().value;
+      || this._pendingWrites.keys().next().value;
     const error = new Error(`${this.venue} 存在未完成的写入权威确认，拒绝继续${action}：${pendingId}`);
     error.pending = true;
     error.clientOrderId = this._pendingPlacements.keys().next().value;
     error.writeId = this._pendingWrites.keys().next().value;
-    error.outcomeId = this._resolvedPlacementOutcomes.keys().next().value;
     throw error;
   }
 
