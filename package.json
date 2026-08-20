@@ -1,0 +1,39 @@
+{
+  "name": "grid-bot-all",
+  "version": "1.0.0",
+  "description": "十交易所整合网格交易机器人：Decibel / Extended / RISEx / Arcus / RHC Lighter / N1 / Phoenix / Phoenix2 / Nado / PopDEX，统一仪表盘。",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "check:config": "node scripts/preflight.js",
+    "audit:release": "node scripts/release-audit.js",
+    "test": "node test/config.test.js && node test/grid.test.js && node test/cancel-safety.test.js && node test/arcus.test.js && node test/live-adapter-safety.test.js && node test/live-new-exchange-lifecycle.test.js && node test/popdex-live.test.js && node test/ui.test.js && node test/new-exchange.test.js && node test/real-market-data.test.js && node test/lighter.test.js && node test/overview.test.js",
+    "test:ui": "node test/ui.test.js",
+    "test:new-exchanges": "node test/new-exchange.test.js",
+    "test:popdex-live": "node test/popdex-live.test.js",
+    "test:live-new-exchanges": "node test/live-new-exchange-lifecycle.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aptos-labs/ts-sdk": "^5.2.1",
+    "@decibeltrade/sdk": "^0.6.0",
+    "@ellipsis-labs/rise": "^0.4.67",
+    "@n1xyz/nord-ts": "^0.6.3",
+    "@nadohq/client": "^0.31.0",
+    "@nadohq/shared": "^0.31.0",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "viem": "^2.52.0",
+    "zod": "^3.25.62",
+    "undici": "^6.19.8"
+  },
+  "optionalDependencies": {
+    "risex-client": "^0.1.0"
+  },
+  "overrides": {
+    "rpc-websockets": "9.3.6"
+  }
+}

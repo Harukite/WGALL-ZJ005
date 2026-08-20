@@ -1,0 +1,3 @@
+# Official Lighter SDK. 1.1.2 includes the current Windows x64 signer and the
+# Robinhood endpoint profile (chain id 466324).
+lighter-sdk==1.1.2

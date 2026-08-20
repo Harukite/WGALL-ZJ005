@@ -1,0 +1,29 @@
+# Credentials: never commit real values.
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# Runtime state, local runtimes and dependency caches.
+.state.json
+.state.json.tmp
+.runtime/
+.lighter-venv/
+node_modules/
+.codex-backups/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Logs, editor files and operating-system metadata.
+*.log
+startup_log.txt
+启动日志.txt
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
