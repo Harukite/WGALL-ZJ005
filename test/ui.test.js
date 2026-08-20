@@ -39,7 +39,9 @@ assert.match(html, /\.overview-grid\s*\{[^}]*repeat\(5, minmax\(0, 1fr\)\)/);
 assert.match(html, /class="btn btn-ghost auth-logout"/);
 assert.match(html, /\/api\/auth\/logout/);
 assert.match(html, /X-Auth-Required/);
-assert.match(loginHtml, /jaychougo@gmail\.com/);
+assert.match(loginHtml, /placeholder="请输入账户邮箱"/);
+assert.doesNotMatch(loginHtml, /value="jaychougo@gmail\.com"/);
+assert.doesNotMatch(loginHtml, /email\.value\s*=\s*data\.accountEmail/);
 assert.match(loginHtml, /autocomplete="current-password"/);
 assert.match(loginHtml, /\/api\/auth\/login/);
 
