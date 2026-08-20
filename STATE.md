@@ -9,10 +9,11 @@
 - 2026-08-19（Asia/Shanghai）：进一步补齐 Nado 普通 PostOnly 的 digest→权威挂单发现、空/失败写响应保护，并加入 N1 session 刷新、Phoenix 确认超时和 Nado 普通下单—查询—撤单 mock 测试；Nado reduce-only maker 仍明确拒绝。
 - 2026-08-20（Asia/Shanghai）：补齐 N1/Phoenix/Phoenix2 成交收敛：N1 使用 `items + actionId`，Phoenix/Phoenix2 使用精确交易签名；覆盖 fills-only 回执、后台成交清理 pending/write、短期结果消费防重发，以及部分成交在远端订单消失后的聚合事件；`npm test`、专项生命周期、配置和 PopDEX 回归均通过。
 - 2026-08-20（Asia/Shanghai）：再次回归 N1、Phoenix、Phoenix2、PopDEX：专项与全量测试均通过，策略文件未改；一致性审阅发现 PopDEX pending 订单的写入屏障/后台 tracking 不完整、Phoenix 确认超时未把 txSignature 回写 pending，另有精度硬编码、PopDEX 小仓位平仓数量抬高和成交结果缓存阻断无关写入等风险，暂未改业务代码。
+- 2026-08-20（Asia/Shanghai）：修复上述回归问题并提交 `a269931`、`b452dca`；PopDEX 精确 clientOid 后台接管进入 `_tracked`，未完成订单发现阻断撤单/撤全/平仓，reduce-only 平仓不再向上抬数量；Phoenix/Phoenix2 超时签名回写 pending；N1/Phoenix/Phoenix2 使用权威市场精度，成交缓存增加数量与 client-id 别名校验；`npm test`、配置预检、语法检查均通过，未发送真实订单。
 
 ## 当前任务
 
-- N1、Phoenix、Phoenix2 的 live 适配器主流程已通过本地回归，但尚有 Phoenix 确认超时成交恢复和公共成交缓存边界待修；PopDEX 尚未达到与共用 live 契约完全一致。Nado 已单独加强 fail-closed，但因协议不支持 reduce-only maker、且当前适配器没有接入可验证的成交历史查询，现有长/短网格 live 仍不等价支持。策略冻结，继续不得修改 `src/grid.js`、`src/bot.js` 的网格算法和订单编排语义。
+- 本轮发现的 N1、Phoenix、Phoenix2、PopDEX live 生命周期问题已修复并完成本地回归；现有网格策略保持冻结，`src/grid.js`、`src/bot.js` 未修改。Nado 仍因协议不支持 reduce-only maker、且当前适配器没有接入可验证的成交历史查询，现有长/短网格 live 不能宣称完全等价支持。
 
 ## 已确认
 
@@ -27,7 +28,7 @@
 ## 未决
 
 - 是否在用户明确授权并提供凭据后执行单笔真实下单—撤单闭环；当前默认只做 paper 与只读验证。
-- 工作树已有用户改动：`README.md` 大幅重写、原 ZIP 删除，并新增源码/测试/文档/依赖等；本次未清理、回退或提交。
+- 本轮提交后工作树 clean；此前 README、源码、测试、文档和依赖等用户改动均被保留在既有提交中，未回退。
 - 根目录未发现项目内 `AGENTS.md`（本轮协作规则来自用户上下文）；`SKILL.md`、`STATE.md` 为本轮按规则新建；`.gitignore`、`.env.example` 已由用户补齐；README 引用的 `docs/发布前检查清单.md` 仍未发现。
 - paper 真实行情依赖各交易所公开接口；N1 的公开历史接口当前只有 `PT1H` snapshot，15m/更细周期不能视为交易所原生 OHLC，只能展示真实 hourly mark-price 序列或按小时聚合。
 - 发布配套文件和 lint/typecheck/CI 是否补齐，待用户决定。
@@ -41,12 +42,11 @@
 - N1/Phoenix/Phoenix2 的 pending/reconcile 已通过 mock SDK/HTTP/Solana seam 验证，但没有官方 sandbox 或真实账户写入证据；上线前仍需单笔最小额度下单—查询—撤单—持仓确认。
 - Nado live 当前可安全覆盖普通 PostOnly 和 IOC reduce-only 平仓的适配器路径；现有 GridBot 的长/短模式依赖 reduce-only maker，未改变策略去迁就协议，因此只能按能力边界使用，不能标记为完整 live 网格闭环。
 - N1/Phoenix/Phoenix2 的成交历史闭环依赖交易所返回可关联的 `actionId`/交易签名；缺少精确关联或历史接口不可用时仍会保留 pending 并阻断写入。Nado 若订单在权威挂单发现前成交，当前只能安全保留 pending，需人工结合成交/持仓核验。
-- Phoenix/Phoenix2 在 `_sendIxs` 确认超时路径把签名放在异常上但未写回 pending，当前该路径无法通过成交历史恢复已成交订单。
-- PopDEX `_pendingOrders` 不接入 `LiveVenueExchange._assertNoPendingPlacements`；订单发现 pending 时仍可发送撤单/撤全/平仓，且后台 `_resolvePendingOrders` 清映射但不注册 `_tracked`，可能留下未跟踪挂单。
-- PopDEX `_matchPlacedOrder` 在缺 clientOid 时退回价格/数量模糊匹配；PopDEX 尚无成交历史接口，订单在 indexer 发现前成交时只能保持 pending。
-- Phoenix/Phoenix2 的全局 LOT/tick 与 N1 的单一 BTC 市场精度是硬编码；若配置或 SDK 暴露其他市场，需先核对权威精度再启用。
-- PopDEX `_roundSize` 对低于最小名义价值的 reduce-only 平仓会向上抬数量；小仓位可能被拒或产生超出实际持仓的请求。
-- 公共 `_resolvedPlacementOutcomes` 在 TTL 内被 `_assertNoPendingPlacements` 视为全局 pending；后台成交后的同一交易所无关反向补单可能暂时被阻断。
+- Phoenix/Phoenix2 的 pending 成交恢复依赖异常中的 `txSignature`、精确交易签名和可用历史接口；现在确认超时签名会写回 pending，历史不可用时仍按 fail-closed 保持 pending。
+- PopDEX 已把 `_pendingOrders` 纳入统一写屏障，后台只接受精确 clientOid 并接管 `_tracked`；indexer 发现前若订单已成交且没有可验证历史，仍只能保留 pending，需人工结合成交/持仓核验。
+- N1/Phoenix/Phoenix2 的市场精度现在读取交易所/SDK 元数据并在缺失时 fail-closed；上线前仍需用真实市场响应复核元数据含义。
+- PopDEX reduce-only 平仓按持仓向下取整，若无法满足最小数量会拒绝发送；不会为满足最小名义价值而超出持仓。
+- 公共成交结果缓存只在同一委托的 market/side/level/price/size 与 client-id 别名匹配时消费，不再作为全局 pending 屏障；交易所人工并发同价同量订单仍是残余识别风险。
 - 新 live 适配器的成交事件只有在订单消失与权威持仓方向变化共同确认时才发出；单纯撤单/过期/拒单不再触发补单，但交易所人工并发交易仍是残余识别风险。
 - 外部仓库只对网格纯函数有测试；本项目五个新增适配器已通过 paper 契约测试和现有 `GridBot` 的中性/做多/做空启停测试，但仍未通过真实账户/网络的交易所集成测试。
 - `live` 模式涉及真实保证金、订单、持仓、手续费、滑点和强平；不能在没有 paper 回归和交易所官网复核的情况下操作。
