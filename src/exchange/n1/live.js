@@ -199,12 +199,68 @@ export class N1Exchange extends LiveVenueExchange {
         }).toString());
       }
     } catch { /* liq price is optional */ }
-    return {
+    const snapshot = {
       price,
       balance: Number.isFinite(equity) ? equity : undefined,
       equity: Number.isFinite(equity) ? equity : undefined,
       position: positionSize ? { sizeBase: positionSize, entryPrice, unrealizedPnl, liquidationPrice } : null,
       openOrders: rows,
+    };
+    await this._reconcilePendingPlacementFills(_marketId);
+    return snapshot;
+  }
+
+  async _findPendingPlacementFill(pending) {
+    if (!this.nord?.getTrades || this.accountId == null) return null;
+    const order = pending.order || {};
+    const expectedSide = order.side === 'buy' ? 'ask' : order.side === 'sell' ? 'bid' : null;
+    if (!expectedSide) return null;
+    let response;
+    try {
+      response = await this.nord.getTrades({
+        marketId: this._remoteMarketId,
+        makerId: this.accountId,
+        takerSide: expectedSide,
+        pageSize: 50,
+        since: new Date(Math.max(0, pending.submittedAt - 30_000)).toISOString(),
+      });
+    } catch {
+      return null;
+    }
+    const rows = Array.isArray(response?.items) ? response.items
+      : Array.isArray(response?.trades) ? response.trades
+        : Array.isArray(response?.data) ? response.data : [];
+    const expectedPrice = Number(order.price);
+    const expectedSize = Math.abs(Number(order.sizeBase));
+    if (!(expectedPrice > 0) || !(expectedSize > 0)) return null;
+    const stepPrice = Number(this.markets.get(Number(order.marketId))?.stepPrice) || 0;
+    const priceTolerance = Math.max(stepPrice * 0.51, expectedPrice * 1e-9, 1e-9);
+    const grouped = new Map();
+    for (const row of rows) {
+      if (Number(row.marketId) !== this._remoteMarketId) continue;
+      if (row.makerId != null && Number(row.makerId) !== Number(this.accountId)) continue;
+      if (String(row.takerSide || '').toLowerCase() !== expectedSide) continue;
+      const actionId = stableId(pending.metadata?.actionId);
+      if (actionId && stableId(row.actionId) !== actionId) continue;
+      const orderId = stableId(row.orderId);
+      const price = Number(row.price);
+      const sizeBase = Math.abs(Number(row.baseSize));
+      if (!orderId || !(price > 0) || !(sizeBase > 0)) continue;
+      if (Math.abs(price - expectedPrice) > priceTolerance) continue;
+      const timestamp = Date.parse(row.time ?? row.timestamp ?? '');
+      if (!actionId && Number.isFinite(timestamp) && timestamp < pending.submittedAt) continue;
+      const item = grouped.get(orderId) || { orderId, sizeBase: 0, quote: 0 };
+      item.sizeBase += sizeBase;
+      item.quote += price * sizeBase;
+      grouped.set(orderId, item);
+    }
+    const matches = [...grouped.values()].filter((item) => item.sizeBase + 1e-12 >= expectedSize);
+    if (matches.length !== 1) return null;
+    const match = matches[0];
+    return {
+      orderId: match.orderId,
+      price: match.quote / match.sizeBase,
+      sizeBase: expectedSize,
     };
   }
 
@@ -215,6 +271,8 @@ export class N1Exchange extends LiveVenueExchange {
 
   async placeLimitOrder(order) {
     this._ensure();
+    const resolved = this._takePendingPlacementOutcome(order);
+    if (resolved) return resolved;
     this._assertNoPendingPlacements('下单');
     if (!this.tradingArmed) throw new Error('N1 实盘下单未授权：设置 N1_TRADING_ARMED=YES');
     await this._ensureSession();
@@ -236,14 +294,31 @@ export class N1Exchange extends LiveVenueExchange {
         accountId: this.accountId,
         clientOrderId: remoteClientOrderId,
       });
+      pending.metadata.actionId = stableId(receipt?.actionId);
+      const receiptFill = receipt?.fills?.find?.((fill) => stableId(fill?.orderId) && Number(fill?.size ?? fill?.sizeBase) > 0);
       const orderId = receipt?.orderId
         ?? receipt?.id
-        ?? receipt?.fills?.find?.((fill) => fill?.orderId != null)?.orderId;
+        ?? receiptFill?.orderId;
       if (!stableId(orderId)) {
+        const filled = await this._resolvePendingPlacementAfterWrite(pending.order);
+        if (filled) return filled;
         throw this._pendingPlacementError(
           new Error('N1 下单回执缺少稳定 orderId'),
           pending,
           'N1 下单结果未知，等待权威挂单对账',
+        );
+      }
+      if (!receipt?.orderId && !receipt?.id && receiptFill) {
+        const marked = this._markPendingPlacementFilled(pending, {
+          orderId,
+          price: Number(receiptFill.price ?? order.price),
+          sizeBase: Number(receiptFill.size ?? receiptFill.sizeBase),
+        });
+        if (marked) return this._takePendingPlacementOutcome(pending.order);
+        throw this._pendingPlacementError(
+          new Error('N1 成交回执缺少有效价格或数量，结果未知'),
+          pending,
+          'N1 下单结果未知，等待权威成交/挂单对账',
         );
       }
       const result = this._registerPlaced(orderId, {
@@ -254,6 +329,8 @@ export class N1Exchange extends LiveVenueExchange {
       this._finishPendingWrite(pending.write);
       return result;
     } catch (error) {
+      const filled = await this._resolvePendingPlacementAfterWrite(pending.order);
+      if (filled) return filled;
       if (!error?.pending) this._pendingPlacementError(error, pending, 'N1 下单结果未知，等待权威挂单对账');
       throw error;
     }

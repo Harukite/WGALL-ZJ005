@@ -57,3 +57,5 @@
 - 2026-08-19：N1/Phoenix/Phoenix2 的 live 写入统一要求 stable client order id；回执、Solana 确认或权威挂单发现不确定时必须留在 pending，后续只接受精确 client id 的权威快照收敛，不允许用价格/数量模糊匹配重发。
 - 2026-08-19：Nado 的 reduce-only maker 仍不能由协议表达；应保留普通 PostOnly 与 IOC reduce-only 平仓能力，拒绝把 reduce-only 限价腿降级为普通开仓单，并对未知 network、digest 缺失和失败 IOC 结果 fail-closed。
 - 2026-08-19：Nado 普通 PostOnly 也必须经过 digest → 权威挂单查询后才能写入 active；SDK 返回空/非 success 的撤单、撤全或 IOC 响应不得当作成功。
+- 2026-08-20：N1 成交历史读取 `items` 页面并优先用下单回执 `actionId` 关联；Phoenix/Phoenix2 成交历史必须精确匹配本次交易签名，再以 `priceTicks:orderSequenceNumber` 生成可追踪 ID，禁止用价格/数量模糊命中其他成交。
+- 2026-08-20：N1 仅含 `fills` 的回执代表订单已完成成交，不能注册为虚假挂单；后台成交对账须清理 pending 写入、保留短期结果防止安全重试重复下单；部分成交须沿用原始委托量并在远端订单消失后聚合发出，保持现有 GridBot 的补单语义。

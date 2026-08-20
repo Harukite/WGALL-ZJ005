@@ -69,6 +69,7 @@ export class LiveVenueExchange extends EventEmitter {
     this._tracked = new Map();
     this._pendingPlacements = new Map();
     this._pendingWrites = new Map();
+    this._resolvedPlacementOutcomes = new Map();
     this._writeSeq = 0;
     this._cancelled = new Set();
     this._watch = new Set();
@@ -76,6 +77,7 @@ export class LiveVenueExchange extends EventEmitter {
     this._timer = null;
     this._busy = false;
     this._graceMs = Math.max(1000, this.pollMs * 2);
+    this._pendingOutcomeTtlMs = Math.max(30_000, Number(opts.pendingOutcomeTtlMs) || 300_000);
   }
 
   _setMarkets(rows, fallbackPrice = 100) {
@@ -180,13 +182,15 @@ export class LiveVenueExchange extends EventEmitter {
   }
 
   _assertNoPendingPlacements(action = '写操作') {
-    if (!this._pendingPlacements.size && !this._pendingWrites.size) return;
+    if (!this._pendingPlacements.size && !this._pendingWrites.size && !this._resolvedPlacementOutcomes.size) return;
     const pendingId = this._pendingPlacements.keys().next().value
-      || this._pendingWrites.keys().next().value;
+      || this._pendingWrites.keys().next().value
+      || this._resolvedPlacementOutcomes.keys().next().value;
     const error = new Error(`${this.venue} 存在未完成的写入权威确认，拒绝继续${action}：${pendingId}`);
     error.pending = true;
     error.clientOrderId = this._pendingPlacements.keys().next().value;
     error.writeId = this._pendingWrites.keys().next().value;
+    error.outcomeId = this._resolvedPlacementOutcomes.keys().next().value;
     throw error;
   }
 
@@ -208,6 +212,9 @@ export class LiveVenueExchange extends EventEmitter {
       clientOrderId: key,
       order: { ...order },
       previousIds: new Set(options.previousIds || []),
+      metadata: { ...(options.metadata || {}) },
+      outcome: null,
+      fill: null,
       submittedAt: Date.now(),
     };
     pending.write = this._beginPendingWrite('place', {
@@ -216,6 +223,96 @@ export class LiveVenueExchange extends EventEmitter {
     });
     this._pendingPlacements.set(key, pending);
     return pending;
+  }
+
+  _markPendingPlacementFilled(pending, fill) {
+    if (!pending || pending.outcome || !this._pendingPlacements.has(pending.clientOrderId)) return false;
+    const orderId = stableId(fill?.orderId ?? fill?.id);
+    const price = Number(fill?.price ?? pending.order.price);
+    const sizeBase = Number(fill?.sizeBase ?? pending.order.sizeBase);
+    if (!orderId || !(price > 0) || !(sizeBase > 0)) return false;
+    pending.outcome = 'filled';
+    pending.fill = { orderId, price, sizeBase };
+    return true;
+  }
+
+  _placementMatches(expected, order) {
+    const marketId = Number(order?.marketId);
+    if (Number(expected?.marketId) !== marketId) return false;
+    if (expected?.side && order?.side && expected.side !== order.side) return false;
+    if (expected?.levelIndex != null && order?.levelIndex != null
+      && Number(expected.levelIndex) !== Number(order.levelIndex)) return false;
+    const expectedPrice = Number(expected?.price);
+    const requestedPrice = Number(order?.price);
+    return !(Number.isFinite(expectedPrice) && Number.isFinite(requestedPrice)
+      && Math.abs(expectedPrice - requestedPrice) > Math.max(1e-12, Math.abs(expectedPrice) * 1e-10));
+  }
+
+  _publishPendingPlacementOutcome(pending) {
+    if (!pending?.fill || !this._pendingPlacements.has(pending.clientOrderId)) return null;
+    const result = {
+      orderId: pending.fill.orderId,
+      price: pending.fill.price,
+      sizeBase: pending.fill.sizeBase,
+      filled: true,
+    };
+    const event = {
+      ...(pending.order || {}),
+      ...result,
+      marketId: Number(pending.order?.marketId),
+      side: pending.order?.side === 'sell' ? 'sell' : 'buy',
+      clientOrderId: pending.clientOrderId,
+    };
+    const key = `${this.venue}:filled:${Date.now().toString(36)}:${++this._writeSeq}`;
+    const record = { key, order: { ...(pending.order || {}) }, result, event };
+    this._pendingPlacements.delete(pending.clientOrderId);
+    this._finishPendingWrite(pending.write);
+    this._resolvedPlacementOutcomes.set(key, record);
+    setTimeout(() => this.emit('fill', event), 0);
+    const cleanup = setTimeout(() => {
+      if (this._resolvedPlacementOutcomes.get(key) === record) this._resolvedPlacementOutcomes.delete(key);
+    }, this._pendingOutcomeTtlMs);
+    cleanup.unref?.();
+    return record;
+  }
+
+  _takePendingPlacementOutcome(order) {
+    for (const [clientOrderId, pending] of this._pendingPlacements) {
+      if (pending.outcome !== 'filled') continue;
+      if (!this._placementMatches(pending.order, order)) continue;
+      return this._publishPendingPlacementOutcome(pending)?.result || null;
+    }
+    for (const [key, record] of this._resolvedPlacementOutcomes) {
+      if (!this._placementMatches(record.order, order)) continue;
+      this._resolvedPlacementOutcomes.delete(key);
+      return record.result;
+    }
+    return null;
+  }
+
+  async _reconcilePendingPlacementFills(marketId) {
+    if (typeof this._findPendingPlacementFill !== 'function') return;
+    const id = Number(marketId);
+    for (const pending of this._pendingPlacements.values()) {
+      if (pending.outcome || Number(pending.order?.marketId) !== id) continue;
+      try {
+        const fill = await this._findPendingPlacementFill(pending);
+        if (fill && this._markPendingPlacementFilled(pending, fill)) {
+          this._publishPendingPlacementOutcome(pending);
+        }
+      } catch { /* a history read cannot authorize a write by itself */ }
+    }
+  }
+
+  async _resolvePendingPlacementAfterWrite(order) {
+    const immediate = this._takePendingPlacementOutcome(order);
+    if (immediate) return immediate;
+    try {
+      const marketId = Number(order.marketId);
+      const snapshot = await this._refreshMarket(marketId);
+      this._applySnapshot(marketId, snapshot);
+    } catch { /* keep the original write pending when authority is unavailable */ }
+    return this._takePendingPlacementOutcome(order);
   }
 
   _pendingPlacementError(error, pending, message = '') {
@@ -230,6 +327,7 @@ export class LiveVenueExchange extends EventEmitter {
   _resolvePendingPlacements(openOrders) {
     const claimed = new Set();
     for (const [clientOrderId, pending] of [...this._pendingPlacements]) {
+      if (pending.outcome) continue;
       const matches = openOrders.filter((row) => clientIdFrom(row) === clientOrderId
         && !claimed.has(stableId(row.orderId ?? row.id)));
       if (matches.length !== 1) continue;
@@ -243,7 +341,7 @@ export class LiveVenueExchange extends EventEmitter {
         ...pending.order,
         clientOrderId,
         price: Number(row.price ?? pending.order.price),
-        sizeBase: Number(row.sizeBase ?? row.size ?? pending.order.sizeBase),
+        sizeBase: Number(pending.order.sizeBase ?? row.sizeBase ?? row.size),
       });
     }
   }
@@ -377,7 +475,7 @@ export class LiveVenueExchange extends EventEmitter {
             this._registerPlaced(orderId, {
               ...write.order,
               price: Number(remote.price ?? write.order.price),
-              sizeBase: Number(remote.sizeBase ?? remote.size ?? write.order.sizeBase),
+              sizeBase: Number(write.order.sizeBase ?? remote.sizeBase ?? remote.size),
             });
           }
         }

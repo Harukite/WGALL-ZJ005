@@ -16,7 +16,7 @@ const order = {
 };
 
 function makeN1Harness({ placeResult, placeError = null } = {}) {
-  const state = { openOrders: [], lastPlaceArgs: null, cancelCalls: 0 };
+  const state = { openOrders: [], lastPlaceArgs: null, placeCalls: 0, cancelCalls: 0 };
   const ex = new N1Exchange({ tradingArmed: true, pollMs: 500 });
   ex.nord = { getMarketStats: async () => ({ perpStats: { mark_price: 100 } }) };
   ex.accountId = 7;
@@ -25,6 +25,7 @@ function makeN1Harness({ placeResult, placeError = null } = {}) {
     fetchInfo: async () => {},
     refreshSession: async () => {},
     placeOrder: async (args) => {
+      state.placeCalls++;
       state.lastPlaceArgs = args;
       if (placeError) throw placeError;
       return placeResult;
@@ -120,6 +121,89 @@ assert.equal(n1Pending.ex._pendingPlacements.size, 0, 'N1 must resolve pending p
 assert.equal(n1Pending.ex.getOpenOrders(1)[0].orderId, '202');
 n1Pending.ex.stop();
 
+const n1Partial = makeN1Harness({ placeResult: { actionId: 6n, fills: [] } });
+let partialPosition = 0;
+n1Partial.ex._refreshMarket = async () => ({
+  price: 100,
+  position: partialPosition ? { sizeBase: partialPosition } : null,
+  openOrders: n1Partial.state.openOrders.map((row) => ({ ...row })),
+});
+await assert.rejects(n1Partial.ex.placeLimitOrder(order), (error) => error?.pending === true);
+const partialClientOrderId = n1Partial.ex._pendingPlacements.keys().next().value;
+n1Partial.state.openOrders = [{
+  orderId: 606,
+  clientOrderId: partialClientOrderId,
+  side: 'buy',
+  price: 99,
+  sizeBase: 0.05,
+}];
+partialPosition = 0.05;
+const partialFills = [];
+n1Partial.ex.on('fill', (fill) => partialFills.push(fill));
+await n1Partial.ex.fetchOpenOrders(1);
+assert.equal(n1Partial.ex.getOpenOrders(1)[0].confirmedFillBase, 0.05, 'N1 must retain a partial fill while the remainder is open');
+assert.equal(partialFills.length, 0, 'partial fill must not trigger a duplicate replacement while the remainder is open');
+n1Partial.ex.getOpenOrders(1)[0].placedAt = Date.now() - n1Partial.ex._graceMs - 1;
+n1Partial.state.openOrders = [];
+await n1Partial.ex.fetchOpenOrders(1);
+await n1Partial.ex.fetchOpenOrders(1);
+assert.equal(partialFills.length, 1, 'N1 must emit the aggregated partial fill once the remote order is gone');
+assert.equal(partialFills[0].sizeBase, 0.05);
+n1Partial.ex.stop();
+
+const n1Filled = makeN1Harness({ placeResult: { actionId: 3n, fills: [] } });
+n1Filled.ex.markets.set(1, { stepPrice: 1 });
+n1Filled.ex.nord.getTrades = async () => ({
+  items: [{
+    marketId: 0,
+    makerId: 7,
+    actionId: 3,
+    takerSide: 'ask',
+    orderId: 303,
+    price: 99,
+    baseSize: 0.1,
+    time: new Date().toISOString(),
+  }],
+});
+n1Filled.ex._refreshMarket = async () => {
+  await n1Filled.ex._reconcilePendingPlacementFills(1);
+  return { price: 100, position: null, openOrders: [] };
+};
+const n1Fills = [];
+n1Filled.ex.on('fill', (fill) => n1Fills.push(fill));
+const filledN1 = await n1Filled.ex.placeLimitOrder(order);
+assert.equal(filledN1.orderId, '303', 'N1 must resolve a fully filled order from account trade history');
+assert.equal(filledN1.filled, true);
+await new Promise((resolve) => setTimeout(resolve, 5));
+assert.equal(n1Fills.length, 1, 'N1 must emit the recovered fill after the caller can register the order');
+assert.equal(n1Filled.ex._pendingPlacements.size, 0);
+n1Filled.ex.stop();
+
+const n1Background = makeN1Harness({ placeResult: { actionId: 4n, fills: [] } });
+await assert.rejects(n1Background.ex.placeLimitOrder(order), (error) => error?.pending === true);
+const backgroundFills = [];
+n1Background.ex.on('fill', (fill) => backgroundFills.push(fill));
+n1Background.ex._findPendingPlacementFill = async () => ({ orderId: 404, price: 99, sizeBase: 0.1 });
+await n1Background.ex._reconcilePendingPlacementFills(1);
+assert.equal(n1Background.ex._pendingPlacements.size, 0, 'background fill reconciliation must consume pending placement state');
+assert.equal(n1Background.ex._pendingWrites.size, 0, 'background fill reconciliation must finish the pending write');
+await new Promise((resolve) => setTimeout(resolve, 5));
+assert.equal(backgroundFills.length, 1, 'background fill reconciliation must emit the fill');
+const resumedN1 = await n1Background.ex.placeLimitOrder(order);
+assert.equal(resumedN1.orderId, '404', 'N1 must consume a background-resolved fill without resubmitting');
+assert.equal(n1Background.state.placeCalls, 1, 'N1 background fill resolution must not send a second order');
+assert.equal(n1Background.ex._pendingPlacements.size, 0);
+n1Background.ex.stop();
+
+const n1FillReceipt = makeN1Harness({
+  placeResult: { actionId: 5n, fills: [{ orderId: 505n, price: 99, size: 0.1 }] },
+});
+const receiptFilledN1 = await n1FillReceipt.ex.placeLimitOrder(order);
+assert.equal(receiptFilledN1.orderId, '505');
+assert.equal(receiptFilledN1.filled, true, 'N1 fills-only receipt must be treated as a completed fill');
+assert.equal(n1FillReceipt.ex.getOpenOrders(1).length, 0, 'N1 fills-only receipt must not create a phantom open order');
+n1FillReceipt.ex.stop();
+
 const n1Session = new N1Exchange({ pollMs: 500 });
 let sessionRefreshes = 0;
 n1Session.nord = {};
@@ -166,6 +250,36 @@ for (const [Venue, venue] of [[PhoenixExchange, 'ph'], [Phoenix2Exchange, 'ph2']
   assert.deepEqual((await pending.ex.fetchOpenOrders(1)).map((row) => row.orderId), ['200:2']);
   assert.equal(pending.ex._pendingPlacements.size, 0, venue + ' must resolve delayed order discovery');
   pending.ex.stop();
+
+  const filled = makePhoenixHarness(Venue, venue);
+  filled.ex.client.api = {
+    trades: () => ({
+      getTraderTradesHistory: async () => ({
+        data: [{
+          marketSymbol: 'BTC-PERP',
+          tradeType: 'limit',
+          signature: 'signature',
+          orderSequenceNumber: 7,
+          baseLotsDelta: '1000',
+          price: '99',
+          timestamp: Date.now(),
+        }],
+      }),
+    }),
+  };
+  filled.ex._refreshMarket = async () => {
+    await filled.ex._reconcilePendingPlacementFills(1);
+    return { price: 100, position: null, openOrders: [] };
+  };
+  const phoenixFills = [];
+  filled.ex.on('fill', (fill) => phoenixFills.push(fill));
+  const filledPhoenix = await filled.ex.placeLimitOrder(order);
+  assert.equal(filledPhoenix.orderId, '99:7', venue + ' must recover a fully filled order from Phoenix trade history');
+  assert.equal(filledPhoenix.filled, true);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(phoenixFills.length, 1, venue + ' must emit the recovered fill after the caller can register the order');
+  assert.equal(filled.ex._pendingPlacements.size, 0);
+  filled.ex.stop();
 }
 
 const phoenixTimeout = new PhoenixExchange({ venue: 'ph', computeUnitLimit: 200_000 });

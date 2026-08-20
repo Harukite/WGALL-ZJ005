@@ -15,7 +15,7 @@ import {
   Side as PhoenixSide,
   createPhoenixClient,
 } from '@ellipsis-labs/rise';
-import { LiveVenueExchange, num, sleep } from '../common/live.js';
+import { LiveVenueExchange, num, sleep, stableId } from '../common/live.js';
 import { fetchPhoenixCandles } from './market-data.js';
 
 const DEFAULT_API = 'https://perp-api.phoenix.trade';
@@ -274,13 +274,15 @@ export class PhoenixExchange extends LiveVenueExchange {
         });
       }
     }
-    return {
+    const result = {
       price,
       balance: collateral > 0 ? collateral : undefined,
       equity: collateral > 0 ? collateral : undefined,
       position: position ? { sizeBase: position, entryPrice, unrealizedPnl } : null,
       openOrders,
     };
+    await this._reconcilePendingPlacementFills(marketId);
+    return result;
   }
 
   async setLeverage() {
@@ -301,8 +303,69 @@ export class PhoenixExchange extends LiveVenueExchange {
     return null;
   }
 
+  async _findPendingPlacementFill(pending) {
+    if (!pending.txSignature) return null;
+    const trades = this.client?.api?.trades?.();
+    if (!trades?.getTraderTradesHistory) return null;
+    const order = pending.order || {};
+    const symbol = this._symbolForMarket(order.marketId);
+    let response;
+    try {
+      response = await trades.getTraderTradesHistory(this.authority, {
+        pdaIndex: 0,
+        marketSymbol: symbol,
+        limit: 100,
+      });
+    } catch {
+      return null;
+    }
+    const rows = Array.isArray(response?.data) ? response.data : [];
+    const expectedPrice = Number(order.price);
+    const expectedSize = Math.abs(Number(order.sizeBase));
+    const priceTicks = pending.metadata?.priceTicks;
+    const txSignature = stableId(pending.txSignature);
+    if (!(expectedPrice > 0) || !(expectedSize > 0) || priceTicks == null || !txSignature) return null;
+    const targetLots = expectedSize / LOT;
+    const expectedSign = order.side === 'buy' ? 1 : order.side === 'sell' ? -1 : 0;
+    const priceTolerance = Math.max(expectedPrice * 1e-9, 1e-8);
+    const grouped = new Map();
+    for (const row of rows) {
+      if (String(row.marketSymbol || '').toUpperCase() !== String(symbol).toUpperCase()) continue;
+      if (row.tradeType && row.tradeType !== 'limit') continue;
+      if (stableId(row.signature) !== txSignature) continue;
+      const sequence = row.orderSequenceNumber;
+      const deltaLots = Number(row.baseLotsDelta);
+      const fillPrice = Number(row.price);
+      if (sequence == null || !Number.isFinite(deltaLots) || !Number.isFinite(fillPrice)
+        || !(Math.abs(deltaLots) > 0) || !(fillPrice > 0)) continue;
+      if (expectedSign && Math.sign(deltaLots) !== expectedSign) continue;
+      if (Math.abs(fillPrice - expectedPrice) > priceTolerance) continue;
+      const timestamp = Number(row.timestamp);
+      const timestampMs = Number.isFinite(timestamp)
+        ? (timestamp > 1e12 ? timestamp : timestamp * 1000)
+        : NaN;
+      if (Number.isFinite(timestampMs) && timestampMs < pending.submittedAt) continue;
+      const key = String(sequence);
+      const item = grouped.get(key) || { sequence: key, lots: 0, quote: 0 };
+      const lots = Math.abs(deltaLots);
+      item.lots += lots;
+      item.quote += fillPrice * lots;
+      grouped.set(key, item);
+    }
+    const matches = [...grouped.values()].filter((item) => item.lots + 1e-9 >= targetLots);
+    if (matches.length !== 1) return null;
+    const match = matches[0];
+    return {
+      orderId: orderId(priceTicks, match.sequence),
+      price: match.quote / match.lots,
+      sizeBase: expectedSize,
+    };
+  }
+
   async placeLimitOrder(order) {
     this._ensure();
+    const resolved = this._takePendingPlacementOutcome(order);
+    if (resolved) return resolved;
     this._assertNoPendingPlacements('下单');
     const marketId = Number(order.marketId);
     const symbol = this._symbolForMarket(marketId);
@@ -310,6 +373,7 @@ export class PhoenixExchange extends LiveVenueExchange {
     if (!(size > 0)) throw new Error(this.id + ' size 小于 lot=' + LOT);
     const price = Number(order.price);
     const before = await this._refreshMarket(marketId);
+    this._applySnapshot(marketId, before);
     const mark = Number(before.price) || await this._mark(symbol);
     if ((order.side === 'sell' && price <= mark) || (order.side === 'buy' && price >= mark)) {
       throw new Error(this.id + ' PostOnly 订单穿价，等待下一轮行情');
@@ -345,7 +409,9 @@ export class PhoenixExchange extends LiveVenueExchange {
       clientOrderId: String(remoteClientOrderId),
       price,
       sizeBase: size,
-    }, remoteClientOrderId);
+    }, remoteClientOrderId, {
+      metadata: { symbol, priceTicks: String(packet.priceInTicks) },
+    });
     try {
       const signature = await this._sendIxs([ix]);
       pending.txSignature = signature;
@@ -356,6 +422,8 @@ export class PhoenixExchange extends LiveVenueExchange {
         price,
       });
       if (!placed) {
+        const filled = await this._resolvePendingPlacementAfterWrite(pending.order);
+        if (filled) return filled;
         throw this._pendingPlacementError(
           new Error(this.id + ' 交易已确认但权威挂单列表暂未发现订单'),
           pending,
@@ -372,6 +440,8 @@ export class PhoenixExchange extends LiveVenueExchange {
       this._finishPendingWrite(pending.write);
       return result;
     } catch (error) {
+      const filled = await this._resolvePendingPlacementAfterWrite(pending.order);
+      if (filled) return filled;
       if (error?.receiptKnown) {
         this._pendingPlacements.delete(pending.clientOrderId);
         this._finishPendingWrite(pending.write);
